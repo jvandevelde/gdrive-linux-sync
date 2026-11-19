@@ -1,0 +1,365 @@
+"""One-way initial sync: mirror My Drive into the local sync root.
+
+Safe to re-run: files already in sync are skipped, remote renames/moves are
+applied locally with a rename instead of a re-download, and a local file that
+differs from the remote is never overwritten — it's kept as a conflicted copy.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+from collections import defaultdict
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Protocol
+
+from gdrivesync.config import TMP_DIRNAME
+from gdrivesync.drive import FOLDER_MIME, SHORTCUT_MIME, is_google_doc
+from gdrivesync.names import dedupe, stub_name, to_local
+from gdrivesync.state import Item, StateDB
+
+
+class DriveLike(Protocol):
+    def root_id(self) -> str: ...
+    def start_page_token(self) -> str: ...
+    def list_all(self) -> Iterable[dict]: ...
+    def download(self, file_id: str, dest: Path) -> None: ...
+
+
+class PullError(RuntimeError):
+    pass
+
+
+@dataclass
+class PullResult:
+    folders: int = 0
+    downloaded: int = 0
+    downloaded_bytes: int = 0
+    stubs: int = 0
+    unchanged: int = 0
+    adopted: int = 0  # local file already had identical content
+    moved: int = 0  # remote rename/move applied locally
+    skipped: int = 0  # shortcuts
+    forgotten: int = 0  # DB rows no longer present remotely
+    conflicts: list[str] = field(default_factory=list)  # conflicted-copy paths
+    errors: list[tuple[str, str]] = field(default_factory=list)  # (path, message)
+
+
+@dataclass
+class _Download:
+    file: dict
+    rel: str
+
+
+# --------------------------------------------------------------------------- helpers
+
+
+def md5_file(path: Path) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _rfc3339_to_ts(s: str) -> float:
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+
+
+def conflict_name(path: Path, now: datetime | None = None) -> Path:
+    stamp = (now or datetime.now()).strftime("%Y-%m-%d %H%M%S")
+    stem, ext = os.path.splitext(path.name)
+    candidate = path.with_name(f"{stem} (conflicted copy {stamp}){ext}")
+    n = 2
+    while candidate.exists():
+        candidate = path.with_name(f"{stem} (conflicted copy {stamp} {n}){ext}")
+        n += 1
+    return candidate
+
+
+def _item(f: dict, rel: str, st: os.stat_result | None) -> Item:
+    return Item(
+        file_id=f["id"],
+        parent_id=(f.get("parents") or [None])[0],
+        name=f["name"],
+        rel_path=rel,
+        is_folder=f["mimeType"] == FOLDER_MIME,
+        mime_type=f["mimeType"],
+        md5=f.get("md5Checksum"),
+        size=int(f["size"]) if "size" in f else None,
+        remote_rev=f.get("headRevisionId"),
+        remote_mtime=f.get("modifiedTime"),
+        local_mtime_ns=st.st_mtime_ns if st else None,
+        local_size=st.st_size if st else None,
+    )
+
+
+def _unchanged_since(prev: Item, st: os.stat_result) -> bool:
+    return prev.local_size == st.st_size and prev.local_mtime_ns == st.st_mtime_ns
+
+
+def build_tree(
+    files: Iterable[dict], root_id: str, excluded: Iterable[str] = ()
+) -> tuple[list[tuple[dict, str]], int]:
+    """Walk My Drive from the root. Returns ([(file, rel_path)] parents-first,
+    number of skipped shortcuts). Local names are made safe and unique per folder;
+    the oldest item keeps the plain name."""
+    excluded = set(excluded)
+    children: dict[str, list[dict]] = defaultdict(list)
+    for f in files:
+        if f.get("trashed"):
+            continue
+        parents = f.get("parents") or []
+        if parents:
+            children[parents[0]].append(f)
+
+    out: list[tuple[dict, str]] = []
+    skipped = 0
+    stack = [(root_id, "")]
+    while stack:
+        parent_id, prefix = stack.pop()
+        kids = sorted(children.get(parent_id, []), key=lambda f: (f.get("createdTime", ""), f["id"]))
+        taken = {TMP_DIRNAME} if prefix == "" else set()
+        for f in kids:
+            mime = f["mimeType"]
+            if mime == SHORTCUT_MIME:
+                skipped += 1
+                continue
+            if f["id"] in excluded:
+                continue
+            local = stub_name(f["name"], mime) if is_google_doc(mime) else to_local(f["name"])
+            local = dedupe(local, taken)
+            taken.add(local)
+            rel = f"{prefix}/{local}" if prefix else local
+            out.append((f, rel))
+            if mime == FOLDER_MIME:
+                stack.append((f["id"], rel))
+    return out, skipped
+
+
+# --------------------------------------------------------------------------- pull
+
+
+def pull(
+    client: DriveLike,
+    db: StateDB,
+    root: Path,
+    *,
+    excluded: Iterable[str] = (),
+    max_workers: int = 4,
+    dry_run: bool = False,
+    log: Callable[[str], None] = print,
+) -> PullResult:
+    root = root.expanduser().resolve()
+    recorded_root = db.get("sync_root")
+    if recorded_root and recorded_root != str(root):
+        raise PullError(
+            f"State DB belongs to sync root {recorded_root!r}, not {str(root)!r}. "
+            "Move the folder back, or delete the state DB to start over."
+        )
+
+    res = PullResult()
+
+    # Grab the change-feed position *before* listing so nothing that changes
+    # during the (possibly long) listing is missed later.
+    page_token = client.start_page_token()
+    root_id = client.root_id()
+    log("Listing My Drive…")
+    entries, res.skipped = build_tree(client.list_all(), root_id, excluded)
+    log(f"Found {len(entries)} items.")
+
+    tmp = root / TMP_DIRNAME
+    if not dry_run:
+        root.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(tmp, ignore_errors=True)  # leftovers from an interrupted run
+        tmp.mkdir()
+        db.set("sync_root", str(root))
+        db.set("root_id", root_id)
+
+    seen: set[str] = set()
+    downloads: list[_Download] = []
+    failed_dirs: set[str] = set()
+
+    for f, rel in entries:
+        seen.add(f["id"])
+        if any(rel.startswith(d + "/") for d in failed_dirs):
+            continue  # parent folder couldn't be created; already reported
+        dest = root / rel
+        mime = f["mimeType"]
+        try:
+            if mime == FOLDER_MIME:
+                if dest.exists() and not dest.is_dir():
+                    raise PullError("a file is in the way of this folder")
+                if not dry_run:
+                    dest.mkdir(exist_ok=True)
+                    db.upsert(_item(f, rel, None))
+                res.folders += 1
+            elif is_google_doc(mime):
+                _write_stub(f, dest, rel, db, dry_run)
+                res.stubs += 1
+            else:
+                if f.get("capabilities", {}).get("canDownload") is False:
+                    raise PullError("Drive does not allow downloading this file")
+                job = _plan_file(f, rel, dest, root, db, res, dry_run, log)
+                if job:
+                    downloads.append(job)
+        except (OSError, PullError) as e:
+            res.errors.append((rel, str(e)))
+            if mime == FOLDER_MIME:
+                failed_dirs.add(rel)
+
+    # Disk space guard.
+    need = sum(int(d.file.get("size", 0)) for d in downloads)
+    if not dry_run and need:
+        free = shutil.disk_usage(root).free
+        if need > free:
+            raise PullError(
+                f"Not enough disk space: need {need / 1e9:.2f} GB, {free / 1e9:.2f} GB free."
+            )
+
+    if dry_run:
+        for d in downloads:
+            log(f"would download {d.rel}")
+        res.downloaded = len(downloads)
+        res.downloaded_bytes = need
+        return res
+
+    if downloads:
+        log(f"Downloading {len(downloads)} files ({need / 1e6:.1f} MB)…")
+        _run_downloads(client, db, root, tmp, downloads, res, max_workers, log)
+
+    # Forget DB rows for items that no longer exist remotely (local files are left alone).
+    for item in db.all():
+        if item.file_id not in seen:
+            db.delete(item.file_id)
+            res.forgotten += 1
+
+    shutil.rmtree(tmp, ignore_errors=True)
+
+    if not res.errors:
+        db.page_token = page_token
+    return res
+
+
+def _write_stub(f: dict, dest: Path, rel: str, db: StateDB, dry_run: bool) -> None:
+    content = json.dumps(
+        {"url": f.get("webViewLink"), "id": f["id"], "mimeType": f["mimeType"]}, indent=2
+    ) + "\n"
+    if dest.is_dir():
+        raise PullError("a folder is in the way of this file")
+    if dry_run:
+        return
+    if not dest.exists() or dest.read_text(errors="replace") != content:
+        dest.write_text(content)
+    if f.get("modifiedTime"):
+        ts = _rfc3339_to_ts(f["modifiedTime"])
+        os.utime(dest, (ts, ts))
+    db.upsert(_item(f, rel, dest.stat()))
+
+
+def _plan_file(
+    f: dict,
+    rel: str,
+    dest: Path,
+    root: Path,
+    db: StateDB,
+    res: PullResult,
+    dry_run: bool,
+    log: Callable[[str], None],
+) -> _Download | None:
+    """Decide what to do for a binary file. Returns a download job or None."""
+    prev = db.by_id(f["id"])
+    remote_md5 = f.get("md5Checksum")
+
+    if dest.exists() or dest.is_symlink():
+        if dest.is_dir() or dest.is_symlink():
+            raise PullError("a folder or symlink is in the way of this file")
+        st = dest.stat()
+        # Already in sync and untouched since.
+        if prev and prev.rel_path == rel and prev.md5 == remote_md5 and _unchanged_since(prev, st):
+            res.unchanged += 1
+            return None
+        # Same content already present (e.g. copied in manually) — just adopt it.
+        if remote_md5 and md5_file(dest) == remote_md5:
+            if not dry_run:
+                db.upsert(_item(f, rel, st))
+            res.adopted += 1
+            return None
+        # Remote changed and the local copy is the untouched previous version: overwrite.
+        if prev and prev.rel_path == rel and _unchanged_since(prev, st):
+            return _Download(f, rel)
+        # Local content differs and wasn't produced by us: keep it as a conflicted copy.
+        backup = conflict_name(dest)
+        log(f"conflict: {rel} -> {backup.name}")
+        if not dry_run:
+            dest.rename(backup)
+        res.conflicts.append(str(backup.relative_to(root)))
+        return _Download(f, rel)
+
+    # Remote rename/move of a file we already have: move it locally instead of re-downloading.
+    if prev and prev.rel_path != rel and prev.md5 == remote_md5:
+        old = root / prev.rel_path
+        if old.is_file() and not old.is_symlink() and _unchanged_since(prev, old.stat()):
+            log(f"move: {prev.rel_path} -> {rel}")
+            if not dry_run:
+                old.rename(dest)
+                db.upsert(_item(f, rel, dest.stat()))
+            res.moved += 1
+            return None
+
+    return _Download(f, rel)
+
+
+def _run_downloads(
+    client: DriveLike,
+    db: StateDB,
+    root: Path,
+    tmp: Path,
+    jobs: list[_Download],
+    res: PullResult,
+    max_workers: int,
+    log: Callable[[str], None],
+) -> None:
+    def work(job: _Download) -> os.stat_result:
+        f = job.file
+        part = tmp / f"{f['id']}.part"
+        try:
+            client.download(f["id"], part)
+            expected = f.get("md5Checksum")
+            if expected and md5_file(part) != expected:
+                raise PullError("checksum mismatch after download")
+            if f.get("modifiedTime"):
+                ts = _rfc3339_to_ts(f["modifiedTime"])
+                os.utime(part, (ts, ts))
+            dest = root / job.rel
+            os.replace(part, dest)
+            return dest.stat()
+        finally:
+            part.unlink(missing_ok=True)
+
+    total = len(jobs)
+    pool = ThreadPoolExecutor(max_workers=max_workers)
+    try:
+        futures = {pool.submit(work, j): j for j in jobs}
+        for n, fut in enumerate(as_completed(futures), 1):
+            job = futures[fut]
+            try:
+                st = fut.result()
+            except Exception as e:  # noqa: BLE001 — report per-file, keep going
+                res.errors.append((job.rel, f"{type(e).__name__}: {e}"))
+                log(f"[{n}/{total}] FAILED {job.rel}: {e}")
+                continue
+            db.upsert(_item(job.file, job.rel, st))  # DB writes stay on this thread
+            res.downloaded += 1
+            res.downloaded_bytes += st.st_size
+            log(f"[{n}/{total}] {job.rel}")
+    except KeyboardInterrupt:
+        pool.shutdown(wait=True, cancel_futures=True)
+        raise
+    pool.shutdown(wait=True)

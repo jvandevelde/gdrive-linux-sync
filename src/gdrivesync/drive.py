@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -17,7 +18,7 @@ SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
 GOOGLE_APPS_PREFIX = "application/vnd.google-apps."
 
 FILE_FIELDS = (
-    "id, name, mimeType, parents, md5Checksum, size, modifiedTime, "
+    "id, name, mimeType, parents, md5Checksum, size, createdTime, modifiedTime, "
     "headRevisionId, trashed, webViewLink, ownedByMe, capabilities/canDownload"
 )
 
@@ -56,8 +57,21 @@ def is_google_doc(mime: str) -> bool:
 
 
 class DriveClient:
+    """Drive API client. Safe to share across threads: the underlying
+    googleapiclient service (httplib2) is not thread-safe, so each thread
+    lazily builds its own."""
+
     def __init__(self, credentials: Any):
-        self._svc = build("drive", "v3", credentials=credentials, cache_discovery=False)
+        self._creds = credentials
+        self._local = threading.local()
+
+    @property
+    def _svc(self) -> Any:
+        svc = getattr(self._local, "svc", None)
+        if svc is None:
+            svc = build("drive", "v3", credentials=self._creds, cache_discovery=False)
+            self._local.svc = svc
+        return svc
 
     # --- account -----------------------------------------------------------
     def about(self) -> dict:
@@ -76,8 +90,10 @@ class DriveClient:
         yield from self._paged_files(q)
 
     def list_all(self) -> Iterator[dict]:
-        """Every non-trashed item owned by me in My Drive."""
-        yield from self._paged_files("trashed = false and 'me' in owners")
+        """Every non-trashed item visible to me. Callers build the My Drive
+        tree from the root; items not reachable from it (e.g. "Shared with
+        me") are ignored. Includes others' files inside my folders."""
+        yield from self._paged_files("trashed = false")
 
     def _paged_files(self, q: str) -> Iterator[dict]:
         token = None

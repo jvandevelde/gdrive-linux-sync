@@ -90,6 +90,11 @@ class StateDB:
         placeholders = ", ".join("?" for _ in _COLS)
         updates = ", ".join(f"{c} = excluded.{c}" for c in _COLS if c != "file_id")
         with self.conn:
+            # A different item may still claim this path (e.g. remote rename/swap).
+            self.conn.execute(
+                "DELETE FROM items WHERE rel_path = ? AND file_id != ?",
+                (item.rel_path, item.file_id),
+            )
             self.conn.execute(
                 f"INSERT INTO items({', '.join(_COLS)}) VALUES({placeholders}) "
                 f"ON CONFLICT(file_id) DO UPDATE SET {updates}",

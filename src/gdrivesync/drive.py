@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import mimetypes
 import random
 import threading
 import time
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
@@ -22,7 +24,19 @@ FILE_FIELDS = (
     "headRevisionId, trashed, webViewLink, ownedByMe, capabilities/canDownload"
 )
 
+RESUMABLE_THRESHOLD = 5 * 1024 * 1024
+CHUNK_SIZE = 8 * 1024 * 1024
+
 T = TypeVar("T")
+
+
+def _q(s: str) -> str:
+    """Escape a value for a Drive query string literal."""
+    return s.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _rfc3339(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 _RETRY_REASONS = {"rateLimitExceeded", "userRateLimitExceeded", "backendError"}
 
@@ -85,9 +99,24 @@ class DriveClient:
         return with_retry(lambda: self._svc.files().get(fileId="root", fields="id").execute())["id"]
 
     # --- listing -----------------------------------------------------------
+    def get_file(self, file_id: str) -> dict | None:
+        """File metadata, or None if it no longer exists / isn't accessible."""
+        try:
+            return with_retry(
+                lambda: self._svc.files().get(fileId=file_id, fields=FILE_FIELDS).execute()
+            )
+        except HttpError as err:
+            if err.resp.status == 404:
+                return None
+            raise
+
     def list_children(self, folder_id: str) -> Iterator[dict]:
-        q = f"'{folder_id}' in parents and trashed = false"
+        q = f"'{_q(folder_id)}' in parents and trashed = false"
         yield from self._paged_files(q)
+
+    def find_children(self, parent_id: str, name: str) -> list[dict]:
+        q = f"'{_q(parent_id)}' in parents and name = '{_q(name)}' and trashed = false"
+        return list(self._paged_files(q))
 
     def list_all(self) -> Iterator[dict]:
         """Every non-trashed item visible to me. Callers build the My Drive
@@ -147,7 +176,80 @@ class DriveClient:
         """Download binary content to dest (caller handles atomic rename)."""
         request = self._svc.files().get_media(fileId=file_id)
         with open(dest, "wb") as fh:
-            downloader = MediaIoBaseDownload(fh, request, chunksize=8 * 1024 * 1024)
+            downloader = MediaIoBaseDownload(fh, request, chunksize=CHUNK_SIZE)
             done = False
             while not done:
                 _, done = with_retry(downloader.next_chunk)
+
+    # --- writes ------------------------------------------------------------
+    def create_folder(self, name: str, parent_id: str) -> dict:
+        body = {"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]}
+        return with_retry(
+            lambda: self._svc.files().create(body=body, fields=FILE_FIELDS).execute()
+        )
+
+    def upload_new(self, path: Path, name: str, parent_id: str, mtime: float | None = None) -> dict:
+        body: dict[str, Any] = {"name": name, "parents": [parent_id]}
+        if mtime is not None:
+            body["modifiedTime"] = _rfc3339(mtime)
+        return self._upload(
+            lambda media: self._svc.files().create(
+                body=body, media_body=media, fields=FILE_FIELDS
+            ),
+            path,
+        )
+
+    def update_content(self, file_id: str, path: Path, mtime: float | None = None) -> dict:
+        body: dict[str, Any] = {}
+        if mtime is not None:
+            body["modifiedTime"] = _rfc3339(mtime)
+        return self._upload(
+            lambda media: self._svc.files().update(
+                fileId=file_id, body=body, media_body=media, fields=FILE_FIELDS
+            ),
+            path,
+        )
+
+    def update_metadata(
+        self,
+        file_id: str,
+        *,
+        name: str | None = None,
+        add_parent: str | None = None,
+        remove_parent: str | None = None,
+    ) -> dict:
+        body = {"name": name} if name else {}
+        kw = {}
+        if add_parent:
+            kw["addParents"] = add_parent
+        if remove_parent:
+            kw["removeParents"] = remove_parent
+        return with_retry(
+            lambda: self._svc.files()
+            .update(fileId=file_id, body=body, fields=FILE_FIELDS, **kw)
+            .execute()
+        )
+
+    def trash(self, file_id: str) -> None:
+        try:
+            with_retry(
+                lambda: self._svc.files()
+                .update(fileId=file_id, body={"trashed": True}, fields="id")
+                .execute()
+            )
+        except HttpError as err:
+            if err.resp.status != 404:
+                raise
+
+    def _upload(self, make_request: Callable[[MediaFileUpload], Any], path: Path) -> dict:
+        size = path.stat().st_size
+        mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        resumable = size > RESUMABLE_THRESHOLD
+        media = MediaFileUpload(str(path), mimetype=mime, resumable=resumable, chunksize=CHUNK_SIZE)
+        request = make_request(media)
+        if not resumable:
+            return with_retry(request.execute)
+        resp = None
+        while resp is None:
+            _, resp = with_retry(request.next_chunk)
+        return resp

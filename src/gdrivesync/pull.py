@@ -68,7 +68,7 @@ def md5_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def _rfc3339_to_ts(s: str) -> float:
+def rfc3339_to_ts(s: str) -> float:
     return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
 
 
@@ -83,7 +83,7 @@ def conflict_name(path: Path, now: datetime | None = None) -> Path:
     return candidate
 
 
-def _item(f: dict, rel: str, st: os.stat_result | None) -> Item:
+def make_item(f: dict, rel: str, st: os.stat_result | None) -> Item:
     return Item(
         file_id=f["id"],
         parent_id=(f.get("parents") or [None])[0],
@@ -100,7 +100,7 @@ def _item(f: dict, rel: str, st: os.stat_result | None) -> Item:
     )
 
 
-def _unchanged_since(prev: Item, st: os.stat_result) -> bool:
+def unchanged_since(prev: Item, st: os.stat_result) -> bool:
     return prev.local_size == st.st_size and prev.local_mtime_ns == st.st_mtime_ns
 
 
@@ -198,7 +198,7 @@ def pull(
                     raise PullError("a file is in the way of this folder")
                 if not dry_run:
                     dest.mkdir(exist_ok=True)
-                    db.upsert(_item(f, rel, None))
+                    db.upsert(make_item(f, rel, None))
                 res.folders += 1
             elif is_google_doc(mime):
                 _write_stub(f, dest, rel, db, dry_run)
@@ -247,20 +247,60 @@ def pull(
     return res
 
 
-def _write_stub(f: dict, dest: Path, rel: str, db: StateDB, dry_run: bool) -> None:
-    content = json.dumps(
+def stub_content(f: dict) -> str:
+    return json.dumps(
         {"url": f.get("webViewLink"), "id": f["id"], "mimeType": f["mimeType"]}, indent=2
     ) + "\n"
+
+
+def read_stub_id(path: Path) -> str | None:
+    """If path is one of our Google-Docs link files, return the file id it points at."""
+    try:
+        if path.stat().st_size > 4096:
+            return None
+        data = json.loads(path.read_text())
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if isinstance(data, dict) and isinstance(data.get("id"), str) and "url" in data:
+        return data["id"]
+    return None
+
+
+def write_stub(f: dict, dest: Path) -> os.stat_result:
+    """Write (or refresh) a Google-Docs link file; returns its stat."""
+    content = stub_content(f)
+    if not dest.exists() or dest.read_text(errors="replace") != content:
+        dest.write_text(content)
+    if f.get("modifiedTime"):
+        ts = rfc3339_to_ts(f["modifiedTime"])
+        os.utime(dest, (ts, ts))
+    return dest.stat()
+
+
+def download_file(client: DriveLike, f: dict, dest: Path, tmp: Path) -> os.stat_result:
+    """Download f to dest atomically via tmp/, verifying MD5 and setting mtime."""
+    tmp.mkdir(parents=True, exist_ok=True)
+    part = tmp / f"{f['id']}.part"
+    try:
+        client.download(f["id"], part)
+        expected = f.get("md5Checksum")
+        if expected and md5_file(part) != expected:
+            raise PullError("checksum mismatch after download")
+        if f.get("modifiedTime"):
+            ts = rfc3339_to_ts(f["modifiedTime"])
+            os.utime(part, (ts, ts))
+        os.replace(part, dest)
+        return dest.stat()
+    finally:
+        part.unlink(missing_ok=True)
+
+
+def _write_stub(f: dict, dest: Path, rel: str, db: StateDB, dry_run: bool) -> None:
     if dest.is_dir():
         raise PullError("a folder is in the way of this file")
     if dry_run:
         return
-    if not dest.exists() or dest.read_text(errors="replace") != content:
-        dest.write_text(content)
-    if f.get("modifiedTime"):
-        ts = _rfc3339_to_ts(f["modifiedTime"])
-        os.utime(dest, (ts, ts))
-    db.upsert(_item(f, rel, dest.stat()))
+    db.upsert(make_item(f, rel, write_stub(f, dest)))
 
 
 def _plan_file(
@@ -282,17 +322,17 @@ def _plan_file(
             raise PullError("a folder or symlink is in the way of this file")
         st = dest.stat()
         # Already in sync and untouched since.
-        if prev and prev.rel_path == rel and prev.md5 == remote_md5 and _unchanged_since(prev, st):
+        if prev and prev.rel_path == rel and prev.md5 == remote_md5 and unchanged_since(prev, st):
             res.unchanged += 1
             return None
         # Same content already present (e.g. copied in manually) — just adopt it.
         if remote_md5 and md5_file(dest) == remote_md5:
             if not dry_run:
-                db.upsert(_item(f, rel, st))
+                db.upsert(make_item(f, rel, st))
             res.adopted += 1
             return None
         # Remote changed and the local copy is the untouched previous version: overwrite.
-        if prev and prev.rel_path == rel and _unchanged_since(prev, st):
+        if prev and prev.rel_path == rel and unchanged_since(prev, st):
             return _Download(f, rel)
         # Local content differs and wasn't produced by us: keep it as a conflicted copy.
         backup = conflict_name(dest)
@@ -305,11 +345,11 @@ def _plan_file(
     # Remote rename/move of a file we already have: move it locally instead of re-downloading.
     if prev and prev.rel_path != rel and prev.md5 == remote_md5:
         old = root / prev.rel_path
-        if old.is_file() and not old.is_symlink() and _unchanged_since(prev, old.stat()):
+        if old.is_file() and not old.is_symlink() and unchanged_since(prev, old.stat()):
             log(f"move: {prev.rel_path} -> {rel}")
             if not dry_run:
                 old.rename(dest)
-                db.upsert(_item(f, rel, dest.stat()))
+                db.upsert(make_item(f, rel, dest.stat()))
             res.moved += 1
             return None
 
@@ -327,21 +367,7 @@ def _run_downloads(
     log: Callable[[str], None],
 ) -> None:
     def work(job: _Download) -> os.stat_result:
-        f = job.file
-        part = tmp / f"{f['id']}.part"
-        try:
-            client.download(f["id"], part)
-            expected = f.get("md5Checksum")
-            if expected and md5_file(part) != expected:
-                raise PullError("checksum mismatch after download")
-            if f.get("modifiedTime"):
-                ts = _rfc3339_to_ts(f["modifiedTime"])
-                os.utime(part, (ts, ts))
-            dest = root / job.rel
-            os.replace(part, dest)
-            return dest.stat()
-        finally:
-            part.unlink(missing_ok=True)
+        return download_file(client, job.file, root / job.rel, tmp)
 
     total = len(jobs)
     pool = ThreadPoolExecutor(max_workers=max_workers)
@@ -355,7 +381,7 @@ def _run_downloads(
                 res.errors.append((job.rel, f"{type(e).__name__}: {e}"))
                 log(f"[{n}/{total}] FAILED {job.rel}: {e}")
                 continue
-            db.upsert(_item(job.file, job.rel, st))  # DB writes stay on this thread
+            db.upsert(make_item(job.file, job.rel, st))  # DB writes stay on this thread
             res.downloaded += 1
             res.downloaded_bytes += st.st_size
             log(f"[{n}/{total}] {job.rel}")

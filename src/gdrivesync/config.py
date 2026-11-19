@@ -32,6 +32,10 @@ BUILTIN_IGNORES = [
     "~$*",
     ".~lock.*#",
     ".goutputstream-*",
+    "*~",
+    ".#*",
+    "*.tmp",
+    ".directory",
 ]
 
 

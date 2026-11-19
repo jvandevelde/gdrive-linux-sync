@@ -1,4 +1,4 @@
-# User service (milestone 2). Install to ~/.config/systemd/user/ and run:
+# User service. Install to ~/.config/systemd/user/ and run:
 #   systemctl --user enable --now gdrivesync
 [Unit]
 Description=Google Drive sync daemon
@@ -8,7 +8,8 @@ After=graphical-session.target network-online.target
 Type=simple
 ExecStart=%h/.local/bin/gdrivesync daemon
 Restart=on-failure
-RestartSec=10
+RestartSec=30
+# Logs go to the journal: journalctl --user -u gdrivesync -f
 
 [Install]
 WantedBy=default.target

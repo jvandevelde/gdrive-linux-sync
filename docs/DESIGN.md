@@ -159,11 +159,35 @@ tests/
 docs/
 ```
 
+## Implementation notes (milestone 2)
+
+- `engine.py` is **state-based**: `remote_pass()` applies the Drive change feed,
+  `local_pass()` scans the tree and diffs against the DB. Both are idempotent, so
+  our own writes echoing back (inotify events, Drive changes) are no-ops.
+- `daemon.py` runs everything on one thread; the watchdog thread only enqueues.
+  Local events are debounced (2 s quiet, max 15 s). Watcher rename events are
+  applied directly so renaming a big folder is one API call; a full scan runs
+  every 10 min as a safety net (every 60 s if inotify is unavailable). Remote
+  polling backs off exponentially on errors.
+- Remote items that fail to apply are stored in `kv.remote_retry_ids` and
+  re-fetched next pass, so the change-feed position can always advance.
+- Offline renames are recovered by matching vanished files to new ones by
+  size + MD5 (or by the id inside a `.gdoc` stub).
+
+### Known limitations / later hardening
+
+- Transfers run one at a time in the service (only the initial pull is parallel).
+- Deleting a folder locally trashes the whole Drive folder, even if something in
+  it was edited on Drive meanwhile (recoverable from Drive's trash).
+- A tiny race window remains between "local file unchanged?" and overwriting it.
+- A crash mid-upload can in rare cases create a duplicate on Drive (mitigated by
+  adopting an identical same-named remote file before uploading).
+
 ## Milestones
 
-1. **Pull-only PoC** — `gdrivesync login`, `gdrivesync pull`: full download of
+1. ✅ **Pull-only PoC** — `gdrivesync login`, `gdrivesync pull`: full download of
    My Drive into the sync folder, populate state DB, `.gdoc` stubs.
-2. **Two-way engine** — local watcher, changes poller, reconciler, conflicts,
+2. ✅ **Two-way engine** — local watcher, changes poller, reconciler, conflicts,
    systemd user service. Test against a scratch Google account.
 3. **D-Bus + Nautilus** — status emblems/column, context menu.
 4. **Tray + settings UI.**

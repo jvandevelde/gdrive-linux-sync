@@ -1,62 +1,14 @@
-import hashlib
 import json
 import os
-from pathlib import Path
 
 import pytest
+from fakedrive import FakeDrive
 
 from gdrivesync.drive import FOLDER_MIME, SHORTCUT_MIME
 from gdrivesync.pull import PullError, pull
 from gdrivesync.state import StateDB
 
 DOC = "application/vnd.google-apps.document"
-
-
-class FakeDrive:
-    def __init__(self):
-        self.files: dict[str, dict] = {}
-        self.content: dict[str, bytes] = {}
-        self.downloads: list[str] = []
-        self.corrupt: set[str] = set()
-        self._n = 0
-
-    def add(self, name, parent="root", mime="text/plain", data=b"", **extra):
-        self._n += 1
-        fid = extra.pop("id", f"id{self._n}")
-        f = {
-            "id": fid,
-            "name": name,
-            "mimeType": mime,
-            "parents": [parent] if parent else [],
-            "createdTime": f"2024-01-01T00:00:{self._n:02d}.000Z",
-            "modifiedTime": "2024-06-01T12:00:00.000Z",
-            "webViewLink": f"https://drive.google.com/file/d/{fid}",
-            **extra,
-        }
-        if mime != FOLDER_MIME and not mime.startswith("application/vnd.google-apps."):
-            self.set_content(f, data)
-        self.files[fid] = f
-        return f
-
-    def set_content(self, f, data):
-        f["md5Checksum"] = hashlib.md5(data).hexdigest()
-        f["size"] = str(len(data))
-        self.content[f["id"]] = data
-
-    # DriveLike
-    def root_id(self):
-        return "root"
-
-    def start_page_token(self):
-        return "tok42"
-
-    def list_all(self):
-        return list(self.files.values())
-
-    def download(self, file_id, dest: Path):
-        self.downloads.append(file_id)
-        data = self.content[file_id]
-        dest.write_bytes(b"garbage" if file_id in self.corrupt else data)
 
 
 @pytest.fixture
@@ -97,9 +49,9 @@ def test_initial_pull_builds_tree(env):
     assert not (root / ".gdrivesync-tmp").exists()  # cleaned up after run
     assert res.skipped == 1 and res.folders == 1 and res.stubs == 1
     assert res.downloaded == 4
-    assert db.page_token == "tok42"
+    assert db.page_token is not None
     # mtime follows Drive's modifiedTime
-    assert int(os.stat(root / "Docs/a.txt").st_mtime) == 1717243200
+    assert int(os.stat(root / "Docs/a.txt").st_mtime) == 1719835200  # 2024-07-01T12:00Z
 
 
 def test_rerun_is_noop(env):
@@ -172,7 +124,7 @@ def test_checksum_mismatch_reports_error_and_keeps_token_unset(env):
     # retry succeeds
     drive.corrupt.clear()
     res = run()
-    assert res.errors == [] and db.page_token == "tok42"
+    assert res.errors == [] and db.page_token is not None
 
 
 def test_removed_remote_items_are_forgotten_but_kept_locally(env):

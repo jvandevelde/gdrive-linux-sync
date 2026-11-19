@@ -97,6 +97,82 @@ def cmd_pull(args: argparse.Namespace) -> int:
     return 0
 
 
+def _setup_logging(verbose: bool) -> None:
+    import logging
+
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    logging.getLogger("googleapiclient").setLevel(logging.WARNING)
+
+
+def _engine(initial_pull: bool = True):
+    """Build a SyncEngine, running the initial pull first if never synced."""
+    from gdrivesync import auth
+    from gdrivesync.drive import DriveClient
+    from gdrivesync.engine import SyncEngine
+    from gdrivesync.localfs import IgnoreRules
+    from gdrivesync.pull import pull
+    from gdrivesync.state import StateDB
+
+    settings = config.Settings.load()
+    client = DriveClient(auth.load_credentials())
+    db = StateDB(config.STATE_DB)
+    if db.page_token is None and initial_pull:
+        import logging
+
+        logging.getLogger("gdrivesync").info("First run: downloading My Drive…")
+        res = pull(
+            client, db, settings.root,
+            excluded=settings.excluded_folder_ids,
+            max_workers=settings.max_transfers,
+            log=logging.getLogger("gdrivesync.pull").info,
+        )
+        if res.errors:
+            for path, msg in res.errors:
+                logging.getLogger("gdrivesync.pull").error("%s: %s", path, msg)
+            from gdrivesync.pull import PullError
+
+            raise PullError(f"Initial download had {len(res.errors)} errors; re-run to retry.")
+    engine = SyncEngine(
+        client, db, settings.root,
+        excluded=settings.excluded_folder_ids,
+        rules=IgnoreRules.load(),
+    )
+    return engine, settings
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    from gdrivesync.daemon import _summary
+
+    _setup_logging(args.verbose)
+    engine, _ = _engine()
+    engine.settle_s = 0
+    engine.allow_mass_delete = args.allow_mass_delete
+    remote = engine.remote_pass()
+    local = engine.local_pass()
+    if engine.dirty:  # conflicted copies to upload
+        local = engine.local_pass()
+    print(f"Drive -> local: {_summary(remote)}")
+    print(f"local -> Drive: {_summary(local)}")
+    errors = remote.errors + local.errors
+    for path, msg in errors:
+        print(f"  error {path}: {msg}", file=sys.stderr)
+    return 2 if errors else 0
+
+
+def cmd_daemon(args: argparse.Namespace) -> int:
+    from gdrivesync.daemon import Daemon
+
+    _setup_logging(args.verbose)
+    engine, settings = _engine()
+    d = Daemon(engine, poll_interval_s=settings.poll_interval_s)
+    d.install_signal_handlers()
+    d.run()
+    return 0
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     s = config.Settings.load()
     if args.sync_root:
@@ -126,6 +202,16 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("-q", "--quiet", action="store_true", help="only print the summary")
     pl.set_defaults(func=cmd_pull)
 
+    sy = sub.add_parser("sync", help="run one two-way sync pass and exit")
+    sy.add_argument("-v", "--verbose", action="store_true")
+    sy.add_argument("--allow-mass-delete", action="store_true",
+                    help="allow trashing many files on Drive that disappeared locally")
+    sy.set_defaults(func=cmd_sync)
+
+    dm = sub.add_parser("daemon", help="run the background sync service")
+    dm.add_argument("-v", "--verbose", action="store_true")
+    dm.set_defaults(func=cmd_daemon)
+
     cfg = sub.add_parser("config", help="show or change settings")
     cfg.add_argument("--sync-root", help="local folder to mirror My Drive into")
     cfg.set_defaults(func=cmd_config)
@@ -138,9 +224,10 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except Exception as e:  # surface auth/config problems cleanly
         from gdrivesync.auth import AuthError
+        from gdrivesync.engine import SyncError
         from gdrivesync.pull import PullError
 
-        if isinstance(e, (AuthError, PullError)):
+        if isinstance(e, (AuthError, PullError, SyncError)):
             print(f"error: {e}", file=sys.stderr)
             return 1
         raise

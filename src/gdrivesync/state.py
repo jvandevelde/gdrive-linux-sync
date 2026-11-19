@@ -117,6 +117,40 @@ class StateDB:
         rows = self.conn.execute("SELECT * FROM items WHERE parent_id = ?", (parent_id,))
         return [self._row(r) for r in rows]
 
+    def descendants(self, rel_path: str) -> list[Item]:
+        """All items below folder rel_path (not including it)."""
+        rows = self.conn.execute(
+            "SELECT * FROM items WHERE substr(rel_path, 1, ?) = ?",
+            (len(rel_path) + 1, rel_path + "/"),
+        )
+        return [self._row(r) for r in rows]
+
+    def in_dir(self, dir_rel: str) -> list[Item]:
+        """Items directly inside local folder dir_rel ("" = sync root)."""
+        if dir_rel == "":
+            rows = self.conn.execute("SELECT * FROM items WHERE instr(rel_path, '/') = 0")
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM items WHERE substr(rel_path, 1, ?) = ? "
+                "AND instr(substr(rel_path, ?), '/') = 0",
+                (len(dir_rel) + 1, dir_rel + "/", len(dir_rel) + 2),
+            )
+        return [self._row(r) for r in rows]
+
+    def move_prefix(self, old: str, new: str) -> None:
+        """Re-path a folder and everything below it."""
+        moved = [self.by_path(old)] if self.by_path(old) else []
+        moved += self.descendants(old)
+        with self.conn:
+            for it in moved:
+                new_path = new + it.rel_path[len(old):]
+                self.conn.execute(
+                    "DELETE FROM items WHERE rel_path = ? AND file_id != ?", (new_path, it.file_id)
+                )
+                self.conn.execute(
+                    "UPDATE items SET rel_path = ? WHERE file_id = ?", (new_path, it.file_id)
+                )
+
     def all(self) -> list[Item]:
         return [self._row(r) for r in self.conn.execute("SELECT * FROM items")]
 

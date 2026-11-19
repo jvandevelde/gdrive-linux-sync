@@ -173,6 +173,40 @@ def cmd_daemon(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    from gdrivesync.doctor import find_duplicates, fix_duplicates
+    from gdrivesync.state import StateDB
+
+    _setup_logging(False)
+    db = StateDB(config.STATE_DB)
+    pending = db.all_pending()
+    if pending:
+        print(f"{len(pending)} interrupted uploads will be resumed or cleaned up on the next sync:")
+        for p in pending:
+            print(f"  {p['rel_path']}")
+    groups = find_duplicates(db)
+    if not groups:
+        print("No duplicates found.")
+        return 0
+    n = sum(len(g.extras) for g in groups)
+    print(f"{n} duplicate(s) on Drive:")
+    for g in groups:
+        for it in g.extras:
+            print(f"  {it.rel_path}  (same as {g.keep.rel_path})")
+    if not args.fix:
+        print("\nRun `gdrivesync doctor --fix` to move the duplicates to the trash "
+              "(on Drive and locally). Stop the service first.")
+        return 1
+    from gdrivesync import auth
+    from gdrivesync.drive import DriveClient
+
+    removed = fix_duplicates(
+        DriveClient(auth.load_credentials()), db, config.Settings.load().root, groups
+    )
+    print(f"Moved {removed} duplicate(s) to the trash.")
+    return 0
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     s = config.Settings.load()
     if args.sync_root:
@@ -211,6 +245,10 @@ def build_parser() -> argparse.ArgumentParser:
     dm = sub.add_parser("daemon", help="run the background sync service")
     dm.add_argument("-v", "--verbose", action="store_true")
     dm.set_defaults(func=cmd_daemon)
+
+    dr = sub.add_parser("doctor", help="find duplicate files/folders on Drive")
+    dr.add_argument("--fix", action="store_true", help="move the duplicates to the trash")
+    dr.set_defaults(func=cmd_doctor)
 
     cfg = sub.add_parser("config", help="show or change settings")
     cfg.add_argument("--sync-root", help="local folder to mirror My Drive into")

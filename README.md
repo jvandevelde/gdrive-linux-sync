@@ -66,6 +66,10 @@ than half (and over 100) of your files vanish at once — run
 `gdrivesync sync --allow-mass-delete` if that was intentional. Files still being written
 (modified in the last few seconds) are uploaded once they settle.
 
+Interrupted uploads (crash, power loss, network drop) are resumed under the same
+Drive file id, so they never leave duplicates. To check for and clean up any
+duplicates from other causes: `gdrivesync doctor` (add `--fix` to trash them).
+
 Ignored by default: `*.part *.swp *.tmp *~ ~$* .~lock.*# .#* .goutputstream-* .directory`.
 Add your own patterns (gitignore-style) to `~/.config/gdrivesync/ignore`.
 

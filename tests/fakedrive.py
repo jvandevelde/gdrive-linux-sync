@@ -16,6 +16,10 @@ class FakeDrive:
         self.downloads: list[str] = []
         self.uploads: list[str] = []
         self.corrupt: set[str] = set()
+        # Names whose next create "succeeds on Drive" but then raises, like a
+        # timeout after the server committed or a crash before we record it.
+        self.crash_after_create: set[str] = set()
+        self._gen = 0
         self._n = 0
         self._lock = threading.Lock()
 
@@ -126,12 +130,33 @@ class FakeDrive:
         self.downloads.append(fid)
         dest.write_bytes(b"garbage" if fid in self.corrupt else self.content[fid])
 
-    def create_folder(self, name, parent_id):
-        return copy.deepcopy(self.add(name, parent_id, FOLDER_MIME))
+    def generate_id(self):
+        self._gen += 1
+        return f"gen{self._gen}"
 
-    def upload_new(self, path, name, parent_id, mtime=None):
-        self.uploads.append(name)
-        return copy.deepcopy(self.add(name, parent_id, data=Path(path).read_bytes()))
+    def _create(self, name, file_id, make):
+        # Same contract as DriveClient._create_idempotent: an id that already
+        # exists means an earlier attempt succeeded, so return that file.
+        if file_id and file_id in self.files:
+            return copy.deepcopy(self.files[file_id])
+        f = make()
+        if name in self.crash_after_create:
+            self.crash_after_create.discard(name)
+            raise ConnectionError("simulated crash after Drive committed the create")
+        return copy.deepcopy(f)
+
+    def create_folder(self, name, parent_id, file_id=None):
+        extra = {"id": file_id} if file_id else {}
+        return self._create(name, file_id, lambda: self.add(name, parent_id, FOLDER_MIME, **extra))
+
+    def upload_new(self, path, name, parent_id, mtime=None, file_id=None):
+        extra = {"id": file_id} if file_id else {}
+
+        def make():
+            self.uploads.append(name)
+            return self.add(name, parent_id, data=Path(path).read_bytes(), **extra)
+
+        return self._create(name, file_id, make)
 
     def update_content(self, fid, path, mtime=None):
         f = self.files[fid]

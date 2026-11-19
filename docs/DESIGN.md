@@ -174,14 +174,32 @@ docs/
 - Offline renames are recovered by matching vanished files to new ones by
   size + MD5 (or by the id inside a `.gdoc` stub).
 
+### Idempotent creates (no duplicates after crashes/retries)
+
+Drive's `files.create` isn't idempotent, so a crash or a retried request after
+Drive committed — but before we recorded it — used to leave a duplicate. Now:
+
+1. Get a file id up front from `files.generateIds` (pooled, 20 at a time).
+2. Journal `(rel_path, file_id, parent_id)` in `pending_creates` **before** calling Drive.
+3. Create with that id. If the call errors but `files.get(id)` finds the file,
+   an earlier attempt succeeded — use it (`DriveClient._create_idempotent`).
+4. Record the item, then delete the journal row.
+
+At the start of every local pass, leftover journal rows are settled: if the item
+was recorded, the row is dropped; if the local file is still there and new, the
+pass resumes with the same id (Drive rejects a second file with that id, and if
+the local content changed meanwhile we push an update); if the local file is gone
+(deleted/renamed while we were down), any orphan on Drive is trashed.
+
+`gdrivesync doctor [--fix]` finds pre-existing duplicates (same folder + name +
+MD5, or same-named empty folders) and trashes the extras.
+
 ### Known limitations / later hardening
 
 - Transfers run one at a time in the service (only the initial pull is parallel).
 - Deleting a folder locally trashes the whole Drive folder, even if something in
   it was edited on Drive meanwhile (recoverable from Drive's trash).
 - A tiny race window remains between "local file unchanged?" and overwriting it.
-- A crash mid-upload can in rare cases create a duplicate on Drive (mitigated by
-  adopting an identical same-named remote file before uploading).
 
 ## Milestones
 

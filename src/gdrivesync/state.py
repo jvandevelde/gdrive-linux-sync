@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +25,17 @@ CREATE TABLE IF NOT EXISTS items (
     local_size      INTEGER
 );
 CREATE INDEX IF NOT EXISTS items_parent ON items(parent_id);
+
+-- Write-ahead journal for creates on Drive. A row is written (with a
+-- pre-generated Drive file id) *before* the create call and removed once the
+-- item is recorded in `items`, so a crash or retry in between can never
+-- produce a duplicate: the next attempt reuses the same id.
+CREATE TABLE IF NOT EXISTS pending_creates (
+    rel_path    TEXT PRIMARY KEY,
+    file_id     TEXT NOT NULL,
+    parent_id   TEXT NOT NULL,
+    created_at  REAL NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
@@ -116,6 +128,27 @@ class StateDB:
     def children(self, parent_id: str) -> list[Item]:
         rows = self.conn.execute("SELECT * FROM items WHERE parent_id = ?", (parent_id,))
         return [self._row(r) for r in rows]
+
+    # --- create journal ----------------------------------------------------
+    def add_pending(self, rel_path: str, file_id: str, parent_id: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO pending_creates VALUES (?, ?, ?, ?)",
+                (rel_path, file_id, parent_id, time.time()),
+            )
+
+    def pending(self, rel_path: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM pending_creates WHERE rel_path = ?", (rel_path,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def all_pending(self) -> list[dict]:
+        return [dict(r) for r in self.conn.execute("SELECT * FROM pending_creates")]
+
+    def remove_pending(self, rel_path: str) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM pending_creates WHERE rel_path = ?", (rel_path,))
 
     def descendants(self, rel_path: str) -> list[Item]:
         """All items below folder rel_path (not including it)."""

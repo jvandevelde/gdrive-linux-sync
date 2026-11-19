@@ -78,6 +78,8 @@ class DriveClient:
     def __init__(self, credentials: Any):
         self._creds = credentials
         self._local = threading.local()
+        self._ids: list[str] = []
+        self._ids_lock = threading.Lock()
 
     @property
     def _svc(self) -> Any:
@@ -182,21 +184,63 @@ class DriveClient:
                 _, done = with_retry(downloader.next_chunk)
 
     # --- writes ------------------------------------------------------------
-    def create_folder(self, name: str, parent_id: str) -> dict:
-        body = {"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]}
-        return with_retry(
-            lambda: self._svc.files().create(body=body, fields=FILE_FIELDS).execute()
+    def generate_id(self) -> str:
+        """A fresh Drive file id to create a file with (makes creates idempotent)."""
+        with self._ids_lock:
+            if not self._ids:
+                resp = with_retry(
+                    lambda: self._svc.files()
+                    .generateIds(count=20, space="drive", type="files")
+                    .execute()
+                )
+                self._ids.extend(resp["ids"])
+            return self._ids.pop()
+
+    def _create_idempotent(self, file_id: str | None, do: Callable[[], dict]) -> dict:
+        """Run a create. If it fails but a file with our pre-generated id exists,
+        an earlier attempt (retry after a timeout, or before a crash) already
+        succeeded — return that file instead of failing or duplicating."""
+        try:
+            return do()
+        except HttpError:
+            if file_id:
+                existing = self.get_file(file_id)
+                if existing is not None:
+                    return existing
+            raise
+
+    def create_folder(self, name: str, parent_id: str, file_id: str | None = None) -> dict:
+        body: dict[str, Any] = {"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]}
+        if file_id:
+            body["id"] = file_id
+        return self._create_idempotent(
+            file_id,
+            lambda: with_retry(
+                lambda: self._svc.files().create(body=body, fields=FILE_FIELDS).execute()
+            ),
         )
 
-    def upload_new(self, path: Path, name: str, parent_id: str, mtime: float | None = None) -> dict:
+    def upload_new(
+        self,
+        path: Path,
+        name: str,
+        parent_id: str,
+        mtime: float | None = None,
+        file_id: str | None = None,
+    ) -> dict:
         body: dict[str, Any] = {"name": name, "parents": [parent_id]}
         if mtime is not None:
             body["modifiedTime"] = _rfc3339(mtime)
-        return self._upload(
-            lambda media: self._svc.files().create(
-                body=body, media_body=media, fields=FILE_FIELDS
+        if file_id:
+            body["id"] = file_id
+        return self._create_idempotent(
+            file_id,
+            lambda: self._upload(
+                lambda media: self._svc.files().create(
+                    body=body, media_body=media, fields=FILE_FIELDS
+                ),
+                path,
             ),
-            path,
         )
 
     def update_content(self, file_id: str, path: Path, mtime: float | None = None) -> dict:

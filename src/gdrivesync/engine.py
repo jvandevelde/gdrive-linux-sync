@@ -391,6 +391,9 @@ class SyncEngine:
         new_dirs = [r for r in new if is_dir_stat(found[r])]
         new_files = [r for r in new if not is_dir_stat(found[r])]
 
+        # Finish or clean up creates interrupted by a crash.
+        self._recover_intents(found, tracked)
+
         # 0. A path that switched between file and folder: drop the old remote item.
         for it in type_changed:
             self._guard(it.rel_path, self._local_deleted, it)
@@ -557,10 +560,53 @@ class SyncEngine:
             c for c in self.client.find_children(parent_id, name)
             if c["mimeType"] == FOLDER_MIME and self.db.by_id(c["id"]) is None
         ]
-        f = existing[0] if existing else self.client.create_folder(name, parent_id)
+        if existing:
+            f = existing[0]
+        else:
+            f = self._create_with_intent(
+                rel, parent_id, lambda fid: self.client.create_folder(name, parent_id, file_id=fid)
+            )
         self.db.upsert(make_item(f, rel, None))
+        self.db.remove_pending(rel)
         self._stats.folders_created += 1
         log.info("created folder %s on Drive", rel)
+
+    def _create_with_intent(self, rel: str, parent_id: str, create) -> dict:
+        """Create on Drive under a pre-generated id journaled in the DB first, so a
+        retry or a crash between "Drive created it" and "we recorded it" reuses
+        the same id instead of making a duplicate."""
+        intent = self.db.pending(rel)
+        if intent and intent["parent_id"] != parent_id:
+            self._abandon_intent(intent)
+            intent = None
+        if intent:
+            log.info("resuming interrupted create of %s", rel)
+            file_id = intent["file_id"]
+        else:
+            file_id = self.client.generate_id()
+            self.db.add_pending(rel, file_id, parent_id)
+        return create(file_id)
+
+    def _abandon_intent(self, intent: dict) -> None:
+        """Trash whatever an interrupted create left on Drive (if anything)."""
+        f = self.client.get_file(intent["file_id"])
+        if f is not None and not f.get("trashed") and self.db.by_id(f["id"]) is None:
+            self.client.trash(f["id"])
+            log.warning("trashed orphaned partial upload of %s on Drive", intent["rel_path"])
+            self._stats.trashed_remote += 1
+        self.db.remove_pending(intent["rel_path"])
+
+    def _recover_intents(self, found: dict, tracked: dict) -> None:
+        """Settle creates journaled by an earlier run that didn't finish."""
+        for intent in self.db.all_pending():
+            rel = intent["rel_path"]
+            if self.db.by_id(intent["file_id"]) is not None:
+                self.db.remove_pending(rel)  # it completed; only the cleanup was lost
+            elif rel in found and rel not in tracked:
+                continue  # still a new local item: this pass resumes it with the same id
+            else:
+                # The local item is gone (deleted/renamed while we were down).
+                self._guard(rel, self._abandon_intent, intent)
 
     def _local_new_file(self, rel: str, st: os.stat_result) -> None:
         path = self._abs(rel)
@@ -580,12 +626,23 @@ class SyncEngine:
             None,
         )
         if f is None:
-            f = self.client.upload_new(path, name, parent_id, mtime=st.st_mtime)
+            f = self._create_with_intent(
+                rel,
+                parent_id,
+                lambda fid: self.client.upload_new(
+                    path, name, parent_id, mtime=st.st_mtime, file_id=fid
+                ),
+            )
+            if f.get("md5Checksum") != local_md5:
+                # Recovered an earlier, interrupted create whose content is now
+                # stale (the file changed since): bring it up to date.
+                f = self.client.update_content(f["id"], path, mtime=st.st_mtime)
             self._stats.uploaded += 1
             log.info("uploaded %s", rel)
         # Base stat is from *before* the upload: if the file changed meanwhile,
         # the next pass sees the difference and uploads again.
         self.db.upsert(make_item(f, rel, st))
+        self.db.remove_pending(rel)
 
     def _local_modified(self, item: Item, st: os.stat_result) -> None:
         path = self._abs(item.rel_path)

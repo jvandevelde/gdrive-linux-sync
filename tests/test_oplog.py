@@ -218,3 +218,19 @@ def test_cli_sync_dry_run(tmp_path, monkeypatch, capsys):
     assert "2 operation(s) would be performed" in out
     assert not (root / "b.txt").exists()
     assert not config.OPS_LOG.exists()
+
+
+def test_dry_run_full_check_is_read_only(tmp_path):
+    drive = FakeDrive()
+    f = drive.add("a.txt", data=b"v1")
+    db = StateDB(":memory:")
+    root = tmp_path / "Drive"
+    pull(drive, db, root, log=lambda m: None)
+    drive.silently(drive.files[f["id"]], data=b"missed")
+    log = OpLog(dry_run=True, echo=lambda m: None)
+    eng = SyncEngine(ReadOnly(drive), db.snapshot(), root, settle_s=0, oplog=log, dry_run=True)
+    eng.full_check()
+    eng.local_pass()
+    assert [(e["op"], e["path"]) for e in log.recent] == [("download", "a.txt")]
+    assert (root / "a.txt").read_bytes() == b"v1"
+    assert db.get("last_full_check") is None

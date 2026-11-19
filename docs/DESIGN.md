@@ -206,6 +206,25 @@ that pair stops with an error instead of mirroring the deletion locally.
 - **Re-included:** the folder is fetched and downloaded with its contents.
 - Remote changes inside excluded folders are ignored.
 
+### Change-feed recovery and full checks
+
+`SyncEngine.full_check()` takes a fresh start token, lists the pair's whole tree
+(`files.list` for all of My Drive, or a per-folder walk for a subfolder pair), and
+feeds it to the same `_apply_remote()` used for the change feed — every listed
+item as "current state", every tracked item not listed as "removed". Unchanged
+items are metadata-only no-ops. One guard was needed for this: a tracked item
+missing locally whose Drive copy hasn't changed is a *pending local deletion*, so
+it isn't re-downloaded (the next local pass trashes it on Drive).
+
+- `DriveClient.changes_since()` raises `InvalidPageToken` on HTTP 400/404/410.
+  Google documents start tokens as non-expiring, but a token from a restored
+  backup, another account, or a corrupted DB is rejected. `remote_pass()` and the
+  daemon's shared poll catch it and call `recover_feed()` → `full_check()`. A
+  second rejection within 10 min raises `SyncError` instead (no listing loops).
+- The daemon runs `full_check()` per pair every `full_check_hours` (default 24)
+  after a successful poll, logging a warning if it found differences (drift the
+  feed missed). The first check after a pull only starts the clock.
+
 ### Operation log and dry run
 
 All mutations in `SyncEngine` go through a small set of `_fx_*` methods

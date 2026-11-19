@@ -29,6 +29,15 @@ CHUNK_SIZE = 8 * 1024 * 1024
 
 T = TypeVar("T")
 
+# HTTP statuses changes.list answers with when the page token itself is bad
+# (Google documents tokens as non-expiring, but a token from a restored backup,
+# another account, or corruption is rejected; reports cite 400 and 410).
+INVALID_TOKEN_STATUSES = {400, 404, 410}
+
+
+class InvalidPageToken(RuntimeError):
+    """Drive rejected our saved change-feed position."""
+
 
 def _q(s: str) -> str:
     """Escape a value for a Drive query string literal."""
@@ -156,18 +165,25 @@ class DriveClient:
         changes: list[dict] = []
         token = page_token
         while True:
-            resp = with_retry(
-                lambda: self._svc.changes()
-                .list(
-                    pageToken=token,
-                    spaces="drive",
-                    pageSize=1000,
-                    includeRemoved=True,
-                    fields=f"nextPageToken, newStartPageToken, "
-                    f"changes(fileId, removed, time, file({FILE_FIELDS}))",
+            try:
+                resp = with_retry(
+                    lambda: self._svc.changes()
+                    .list(
+                        pageToken=token,
+                        spaces="drive",
+                        pageSize=1000,
+                        includeRemoved=True,
+                        fields=f"nextPageToken, newStartPageToken, "
+                        f"changes(fileId, removed, time, file({FILE_FIELDS}))",
+                    )
+                    .execute()
                 )
-                .execute()
-            )
+            except HttpError as err:
+                if err.resp.status in INVALID_TOKEN_STATUSES:
+                    raise InvalidPageToken(
+                        f"Drive rejected change-feed position {token!r} (HTTP {err.resp.status})"
+                    ) from err
+                raise
             changes.extend(resp.get("changes", []))
             if "newStartPageToken" in resp:
                 return changes, resp["newStartPageToken"]

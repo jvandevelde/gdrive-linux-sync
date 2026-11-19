@@ -98,6 +98,22 @@ def cmd_ls(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- pairs
 
 
+def _last_full_check(pair) -> str:
+    from datetime import datetime
+
+    from gdrivesync.engine import FULL_CHECK_KEY
+    from gdrivesync.state import StateDB
+
+    if not pair.db_path.exists():
+        return "never (not synced yet)"
+    db = StateDB(pair.db_path)
+    try:
+        ts = db.get(FULL_CHECK_KEY)
+    finally:
+        db.close()
+    return datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M") if ts else "never"
+
+
 def cmd_pair_list(args: argparse.Namespace) -> int:
     from gdrivesync.pairs import excluded_listing
 
@@ -107,6 +123,7 @@ def cmd_pair_list(args: argparse.Namespace) -> int:
         return 0
     for p in settings.pairs:
         print(f"{p.name}\n  local : {p.root}\n  Drive : {p.remote_path}")
+        print(f"  last full check: {_last_full_check(p)}")
         for ex in excluded_listing(p):
             print(f"  excluded: {ex}")
     return 0
@@ -308,7 +325,8 @@ def _dry_run_sync(args, settings, pairs) -> int:
             dry_run=True,
         )
         engine.allow_mass_delete = args.allow_mass_delete
-        stats = [engine.remote_pass(), engine.local_pass()]
+        remote = engine.full_check() if args.full else engine.remote_pass()
+        stats = [remote, engine.local_pass()]
         if engine.dirty:
             stats.append(engine.local_pass())
         for st in stats:
@@ -335,7 +353,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     for engine in _engines(settings, pairs, _client(), _oplog()):
         engine.settle_s = 0
         engine.allow_mass_delete = args.allow_mass_delete
-        remote = engine.remote_pass()
+        remote = engine.full_check() if args.full else engine.remote_pass()
         local = engine.local_pass()
         if engine.dirty:  # conflicted copies to upload
             local = engine.local_pass()
@@ -354,7 +372,11 @@ def cmd_daemon(args: argparse.Namespace) -> int:
     _setup_logging(args.verbose)
     settings = config.Settings.load()
     engines = _engines(settings, _selected_pairs(settings, None), _client(), _oplog())
-    d = Daemon(engines, poll_interval_s=settings.poll_interval_s)
+    d = Daemon(
+        engines,
+        poll_interval_s=settings.poll_interval_s,
+        full_check_s=settings.full_check_hours * 3600,
+    )
     d.install_signal_handlers()
     d.run()
     return 0
@@ -464,6 +486,9 @@ def cmd_config(args: argparse.Namespace) -> int:
     if args.max_transfers is not None:
         s.max_transfers = max(1, args.max_transfers)
         changed = True
+    if args.full_check_hours is not None:
+        s.full_check_hours = max(0.0, args.full_check_hours)
+        changed = True
     if changed:
         s.save()
     print(f"config dir     : {config.CONFIG_DIR}")
@@ -472,6 +497,7 @@ def cmd_config(args: argparse.Namespace) -> int:
     print(f"operation log  : {config.OPS_LOG}")
     print(f"poll interval  : {s.poll_interval_s}s")
     print(f"max transfers  : {s.max_transfers}")
+    print(f"full check     : " + (f"every {s.full_check_hours:g}h" if s.full_check_hours else "off"))
     print(f"synced folders : {len(s.pairs)} (see `gdrivesync pair list`)")
     if changed:
         print(RESTART_HINT)
@@ -523,6 +549,8 @@ def build_parser() -> argparse.ArgumentParser:
     sy.add_argument("-v", "--verbose", action="store_true")
     sy.add_argument("-n", "--dry-run", action="store_true",
                     help="show every change that would be made, without making any")
+    sy.add_argument("--full", action="store_true",
+                    help="compare everything with Drive instead of only recent changes")
     sy.add_argument("--allow-mass-delete", action="store_true",
                     help="allow trashing many files on Drive that disappeared locally")
     sy.set_defaults(func=cmd_sync)
@@ -545,6 +573,8 @@ def build_parser() -> argparse.ArgumentParser:
     cfg = sub.add_parser("config", help="show or change settings")
     cfg.add_argument("--poll-interval", type=int, help="seconds between Drive checks")
     cfg.add_argument("--max-transfers", type=int, help="parallel downloads during pull")
+    cfg.add_argument("--full-check-hours", type=float,
+                     help="how often the service compares everything with Drive (0 = never)")
     cfg.set_defaults(func=cmd_config)
     return p
 

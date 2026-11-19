@@ -24,7 +24,8 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from gdrivesync.config import TMP_DIRNAME
-from gdrivesync.engine import SyncEngine
+from gdrivesync.drive import InvalidPageToken
+from gdrivesync.engine import FULL_CHECK_KEY, SyncEngine
 
 log = logging.getLogger("gdrivesync.daemon")
 
@@ -84,7 +85,12 @@ class _Slot:
 
 class Daemon:
     def __init__(
-        self, engines: list[SyncEngine] | SyncEngine, *, poll_interval_s: float = 45.0, watch: bool = True
+        self,
+        engines: list[SyncEngine] | SyncEngine,
+        *,
+        poll_interval_s: float = 45.0,
+        full_check_s: float = 24 * 3600,
+        watch: bool = True,
     ):
         if isinstance(engines, SyncEngine):
             engines = [engines]
@@ -93,6 +99,7 @@ class Daemon:
         self.slots = [_Slot(e) for e in engines]
         self.client = engines[0].client
         self.poll_interval_s = poll_interval_s
+        self.full_check_s = full_check_s
         self.watch = watch
         self.q: queue.Queue = queue.Queue()
         self._stop = threading.Event()
@@ -162,6 +169,20 @@ class Daemon:
                 continue
             try:
                 changes, new_token = self.client.changes_since(token)
+            except InvalidPageToken as e:
+                # Detected a rejected feed position: recover each affected pair.
+                for slot in slots:
+                    eng = slot.engine
+                    stats = self._safe(f"[{self._label(eng)}] recovery", eng.recover_feed, e)
+                    if stats is None:
+                        ok = False
+                    else:
+                        log.warning("[%s] recovered by full comparison with Drive: %s",
+                                    self._label(eng), _summary(stats))
+                    if eng.dirty:
+                        eng.dirty = False
+                        slot.mark(time.monotonic())
+                continue
             except Exception:  # noqa: BLE001
                 log.exception("polling Drive failed")
                 ok = False
@@ -177,6 +198,34 @@ class Daemon:
                     eng.dirty = False
                     slot.mark(time.monotonic())
         return ok
+
+    def full_checks_due(self) -> None:
+        """Periodic safety net on the Drive side (like the local full scan):
+        compare each pair with Drive and report anything the change feed missed."""
+        if self.full_check_s <= 0:
+            return
+        now = time.time()
+        for slot in self.slots:
+            eng = slot.engine
+            last = float(eng.db.get(FULL_CHECK_KEY) or 0)
+            if now - last < self.full_check_s:
+                continue
+            if last == 0:
+                # Never checked (e.g. fresh pull): start the clock instead of
+                # re-listing Drive right after a full download.
+                eng.db.set(FULL_CHECK_KEY, str(now))
+                continue
+            stats = self._safe(f"[{self._label(eng)}] full check", eng.full_check)
+            if stats is None:
+                continue
+            if stats.changed or stats.errors:
+                log.warning("[%s] full check found differences the change feed missed: %s",
+                            self._label(eng), _summary(stats))
+            else:
+                log.info("[%s] full check: everything matches Drive", self._label(eng))
+            if eng.dirty:
+                eng.dirty = False
+                slot.mark(time.monotonic())
 
     # ---------------------------------------------------------------- loop
     def run(self) -> None:
@@ -230,6 +279,8 @@ class Daemon:
                         remote_failures += 1
                         delay = min(MAX_BACKOFF_S, 15.0 * 2 ** (remote_failures - 1))
                     next_remote = time.monotonic() + delay
+                    if remote_failures == 0:
+                        self.full_checks_due()
 
                 if now >= next_full:
                     next_full = now + full_scan_every

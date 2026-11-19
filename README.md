@@ -61,10 +61,26 @@ service. Nautilus integration is next.
 | Ignore files by pattern | `~/.config/gdrivesync/ignore` (gitignore-style) |
 | How often to check Drive | `gdrivesync config --poll-interval 30` (seconds, default 45) |
 | Parallel downloads in `pull` | `gdrivesync config --max-transfers 8` |
+| Full comparison with Drive | `gdrivesync config --full-check-hours 12` (default 24, `0` = off). Run one now: `gdrivesync sync --full` (add `--dry-run` to preview) |
 
 Everything lives in `~/.config/gdrivesync/settings.json`; restart the service after
 changes (`systemctl --user restart gdrivesync`). Older single-folder configs are
 migrated automatically to a pair called "My Drive".
+
+## Other devices and missed changes
+
+Your phone, the web and other computers all change the same Drive; their changes arrive
+through Drive's change feed within one poll interval. Two safety nets cover the feed itself:
+
+- **Rejected feed position** (e.g. after restoring an old backup of the sync state): detected
+  automatically. The service compares the whole folder with Drive, applies the differences
+  with the usual rules (local edits kept, conflicts → conflicted copies, nothing re-downloaded
+  that hasn't changed), and continues from a fresh position. If Drive rejects it again within
+  10 minutes the service stops retrying and logs an error instead of re-listing Drive in a loop.
+- **Daily full check**: every 24 h each pair is compared with Drive in full. If that finds
+  anything the feed missed, it's applied and a warning is logged
+  (`journalctl --user -u gdrivesync | grep "full check"`). `gdrivesync pair list` shows when
+  each pair was last checked.
 
 ## Dry run and operation log
 

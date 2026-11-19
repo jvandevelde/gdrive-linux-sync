@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from gdrivesync.config import BUILTIN_IGNORES, TMP_DIRNAME
-from gdrivesync.drive import FOLDER_MIME, SHORTCUT_MIME, is_google_doc
+from gdrivesync.drive import FOLDER_MIME, SHORTCUT_MIME, InvalidPageToken, is_google_doc
 from gdrivesync.localfs import IgnoreRules, is_dir_stat, scan, trash_local
 from gdrivesync.oplog import OpLog
 from gdrivesync.names import DEFAULT_STUB_EXT, DOC_STUB_EXT, dedupe, stub_name, to_local, to_remote
@@ -37,6 +37,7 @@ from gdrivesync.pull import (
     PullError,
     conflict_name,
     download_file,
+    list_subtree,
     make_item,
     md5_file,
     read_stub_id,
@@ -51,6 +52,9 @@ log = logging.getLogger("gdrivesync.engine")
 STUB_EXTS = tuple(set(DOC_STUB_EXT.values()) | {DEFAULT_STUB_EXT})
 RETRY_KEY = "remote_retry_ids"
 EXCLUDED_KEY = "excluded_paths"  # {folder_id: local rel path it would occupy}
+FULL_CHECK_KEY = "last_full_check"  # unix time of the last full comparison with Drive
+FEED_RESET_KEY = "last_feed_reset"  # unix time we last recovered from a rejected position
+FEED_RESET_COOLDOWN_S = 600
 
 
 class SyncError(RuntimeError):
@@ -359,8 +363,54 @@ class SyncEngine:
         token = self.db.page_token
         if token is None:
             raise SyncError("No change-feed position yet; run `gdrivesync pull` first.")
-        changes, new_token = self.client.changes_since(token)
+        try:
+            changes, new_token = self.client.changes_since(token)
+        except InvalidPageToken as e:
+            return self.recover_feed(e)
         return self.apply_changes(changes, new_token)
+
+    def recover_feed(self, cause: Exception) -> PassStats:
+        """Drive rejected our change-feed position: compare everything with
+        Drive directly and continue from a fresh position."""
+        last = float(self.db.get(FEED_RESET_KEY) or 0)
+        if time.time() - last < FEED_RESET_COOLDOWN_S:
+            # Rejected again right after a reset: something else is wrong; don't
+            # burn API quota re-listing Drive every poll.
+            raise SyncError(f"Drive keeps rejecting the change feed ({cause}); not retrying yet.")
+        log.warning("[%s] %s — re-checking everything against Drive", self.name or self.root, cause)
+        stats = self.full_check()
+        self.db.set(FEED_RESET_KEY, str(time.time()))
+        return stats
+
+    def full_check(self) -> PassStats:
+        """Compare the whole tree with Drive (not just the change feed) and apply
+        any differences. Recovers from a lost/rejected feed position and detects
+        anything the feed missed. Uses the same per-item logic as remote_pass, so
+        local edits are kept, conflicts become conflicted copies, and unchanged
+        files aren't re-downloaded."""
+        self._stats = PassStats()
+        # Take the new position first so nothing changing during the listing is lost.
+        token = self.client.start_page_token()
+        drive_root = self.client.root_id()
+        if self.root_id != drive_root:
+            r = self.client.get_file(self.root_id)
+            if r is None or r.get("trashed"):
+                raise SyncError(
+                    f"The Drive folder for {self.name or self.root} was deleted or trashed. "
+                    "Restore it on Drive, or remove this pair."
+                )
+            listing = list_subtree(self.client, self.root_id, self.excluded)
+        else:
+            listing = list(self.client.list_all())
+
+        latest: dict[str, dict | None] = {f["id"]: f for f in listing if f["id"] != self.root_id}
+        for it in self.db.all():
+            latest.setdefault(it.file_id, None)  # tracked but gone from Drive
+        failed = self._apply_remote(latest)
+        self.db.set(RETRY_KEY, json.dumps(failed))
+        self.db.page_token = token
+        self.db.set(FULL_CHECK_KEY, str(time.time()))
+        return self._stats
 
     def apply_changes(self, changes: list[dict], new_token: str) -> PassStats:
         """Apply a batch from the Drive change feed (which may be shared between
@@ -535,6 +585,20 @@ class SyncEngine:
             item.rel_path = rel
 
         dest = self._abs(rel)
+        if rel == item.rel_path and not dest.exists() and not dest.is_symlink():
+            unchanged_on_drive = item.is_folder or (
+                f.get("md5Checksum") == item.md5
+                and (item.md5 is not None or f.get("modifiedTime") == item.remote_mtime)
+            )
+            if unchanged_on_drive:
+                # Deleted locally, not changed on Drive: a pending local deletion
+                # (the next local pass trashes it on Drive). Don't resurrect it.
+                new = make_item(f, rel, None)
+                new.md5 = item.md5
+                new.local_mtime_ns, new.local_size = item.local_mtime_ns, item.local_size
+                self.db.upsert(new)
+                return
+
         if item.is_folder:
             self._fx_mkdir(rel)
             self.db.upsert(make_item(f, rel, None))

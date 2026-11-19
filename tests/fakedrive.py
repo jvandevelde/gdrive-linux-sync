@@ -5,7 +5,7 @@ import hashlib
 import threading
 from pathlib import Path
 
-from gdrivesync.drive import FOLDER_MIME, GOOGLE_APPS_PREFIX
+from gdrivesync.drive import FOLDER_MIME, GOOGLE_APPS_PREFIX, InvalidPageToken
 
 
 class FakeDrive:
@@ -20,6 +20,8 @@ class FakeDrive:
         # timeout after the server committed or a crash before we record it.
         self.crash_after_create: set[str] = set()
         self._gen = 0
+        self.min_token = 0  # positions older than this are rejected
+        self.feed_calls = 0
         self._n = 0
         self._lock = threading.Lock()
 
@@ -100,7 +102,22 @@ class FakeDrive:
     def start_page_token(self):
         return str(len(self.changelog))
 
+    def reject_old_positions(self):
+        """Make every position handed out so far invalid."""
+        self.min_token = len(self.changelog)
+
+    def silently(self, f, data=None, **fields):
+        """Change a file without it showing up in the change feed (a 'missed' change)."""
+        n = len(self.changelog)
+        if data is not None:
+            self.set_content(f, data)
+        f.update(fields)
+        del self.changelog[n:]
+
     def changes_since(self, token):
+        self.feed_calls += 1
+        if not str(token).isdigit() or int(token) < self.min_token:
+            raise InvalidPageToken(f"rejected {token!r}")
         ids = self.changelog[int(token):]
         changes = []
         for fid in dict.fromkeys(ids):

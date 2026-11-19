@@ -174,6 +174,38 @@ docs/
 - Offline renames are recovered by matching vanished files to new ones by
   size + MD5 (or by the id inside a `.gdoc` stub).
 
+### Folder pairs
+
+Settings hold a list of pairs `{name, local, remote_path, remote_id,
+excluded_folder_ids, db}`; `remote_id = "root"` means all of My Drive. Each pair
+gets its own `SyncEngine` and SQLite DB (`~/.local/share/gdrivesync/pair-<name>.db`;
+a migrated legacy setup keeps `state.db`). Pairs may not overlap locally or on
+Drive (checked by walking each Drive folder's parent chain).
+
+The Drive change feed is account-wide. The daemon groups engines by their saved
+feed position and makes one `changes.list` call per distinct position; every
+engine in the group applies the same batch and ignores items outside its root
+(their parent chain doesn't lead to a folder it tracks). After one poll all
+pairs share a position, so it's one call per poll regardless of pair count.
+A file moved on Drive from one pair to another is removed from the first and
+downloaded into the second. If a pair's own Drive folder is trashed or deleted,
+that pair stops with an error instead of mirroring the deletion locally.
+
+### Selective sync (excluded folders)
+
+`reconcile_exclusions()` runs at the start of every local pass:
+
+- **Newly excluded, still synced locally:** if everything inside is on Drive
+  (no untracked files, no unsynced edits), the local copy is deleted (not trashed —
+  it's all on Drive) and its DB rows dropped. Otherwise it's retried next pass,
+  after the pending changes have been uploaded.
+- The local path an excluded folder would occupy is remembered
+  (`kv.excluded_paths`, updated when it's renamed/moved on Drive). The local scan
+  skips that path, so a local folder of the same name is never uploaded as a
+  duplicate.
+- **Re-included:** the folder is fetched and downloaded with its contents.
+- Remote changes inside excluded folders are ignored.
+
 ### Idempotent creates (no duplicates after crashes/retries)
 
 Drive's `files.create` isn't idempotent, so a crash or a retried request after

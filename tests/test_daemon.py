@@ -59,3 +59,31 @@ def test_daemon_end_to_end(running):
     # remote change arrives locally
     drive.add("from-web.txt", parent=folder["id"], data=b"web")
     assert wait_for(lambda: (root / "Renamed/from-web.txt").exists())
+
+
+def test_daemon_multiple_pairs(tmp_path, monkeypatch):
+    monkeypatch.setattr(daemon_mod, "DEBOUNCE_S", 0.2)
+    monkeypatch.setattr(daemon_mod, "MAX_DELAY_S", 1.0)
+    drive = FakeDrive()
+    a = drive.add("A", mime=FOLDER_MIME)
+    b = drive.add("B", mime=FOLDER_MIME)
+    engines = []
+    for f in (a, b):
+        db = StateDB(tmp_path / f"{f['name']}.db")
+        root = tmp_path / f"local-{f['name']}"
+        pull(drive, db, root, root_id=f["id"], log=lambda m: None)
+        engines.append(SyncEngine(drive, db, root, remote_root_id=f["id"], settle_s=0.3, name=f["name"]))
+    dm = Daemon(engines, poll_interval_s=0.3)
+    t = threading.Thread(target=dm.run, daemon=True)
+    t.start()
+    try:
+        (tmp_path / "local-A/one.txt").write_bytes(b"1")
+        (tmp_path / "local-B/two.txt").write_bytes(b"2")
+        assert wait_for(lambda: drive.live().get("A/one.txt") == b"1")
+        assert wait_for(lambda: drive.live().get("B/two.txt") == b"2")
+        drive.add("from-web.txt", parent=b["id"], data=b"w")
+        assert wait_for(lambda: (tmp_path / "local-B/from-web.txt").exists())
+        assert not (tmp_path / "local-A/from-web.txt").exists()
+    finally:
+        dm.stop()
+        t.join(timeout=5)

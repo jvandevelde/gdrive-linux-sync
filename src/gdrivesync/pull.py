@@ -27,6 +27,7 @@ from gdrivesync.state import Item, StateDB
 
 class DriveLike(Protocol):
     def root_id(self) -> str: ...
+    def list_children(self, folder_id: str) -> Iterable[dict]: ...
     def start_page_token(self) -> str: ...
     def list_all(self) -> Iterable[dict]: ...
     def download(self, file_id: str, dest: Path) -> None: ...
@@ -104,6 +105,19 @@ def unchanged_since(prev: Item, st: os.stat_result) -> bool:
     return prev.local_size == st.st_size and prev.local_mtime_ns == st.st_mtime_ns
 
 
+def list_subtree(client: DriveLike, folder_id: str, excluded: Iterable[str] = ()) -> list[dict]:
+    """Everything below folder_id (one listing call per folder; skips excluded)."""
+    excluded = set(excluded)
+    out: list[dict] = []
+    stack = [folder_id]
+    while stack:
+        for f in client.list_children(stack.pop()):
+            out.append(f)
+            if f["mimeType"] == FOLDER_MIME and f["id"] not in excluded:
+                stack.append(f["id"])
+    return out
+
+
 def build_tree(
     files: Iterable[dict], root_id: str, excluded: Iterable[str] = ()
 ) -> tuple[list[tuple[dict, str]], int]:
@@ -151,6 +165,7 @@ def pull(
     db: StateDB,
     root: Path,
     *,
+    root_id: str | None = None,
     excluded: Iterable[str] = (),
     max_workers: int = 4,
     dry_run: bool = False,
@@ -169,9 +184,19 @@ def pull(
     # Grab the change-feed position *before* listing so nothing that changes
     # during the (possibly long) listing is missed later.
     page_token = client.start_page_token()
-    root_id = client.root_id()
-    log("Listing My Drive…")
-    entries, res.skipped = build_tree(client.list_all(), root_id, excluded)
+    drive_root = client.root_id()
+    if root_id in (None, "root"):
+        root_id = drive_root
+    recorded_id = db.get("root_id")
+    if recorded_id and recorded_id != root_id:
+        raise PullError("State DB belongs to a different Drive folder.")
+    if root_id == drive_root:
+        log("Listing My Drive…")
+        listing = client.list_all()
+    else:
+        log("Listing folder…")
+        listing = list_subtree(client, root_id, excluded)
+    entries, res.skipped = build_tree(listing, root_id, excluded)
     log(f"Found {len(entries)} items.")
 
     tmp = root / TMP_DIRNAME

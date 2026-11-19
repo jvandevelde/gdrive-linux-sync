@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import posixpath
+import shutil
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -45,6 +46,7 @@ log = logging.getLogger("gdrivesync.engine")
 
 STUB_EXTS = tuple(set(DOC_STUB_EXT.values()) | {DEFAULT_STUB_EXT})
 RETRY_KEY = "remote_retry_ids"
+EXCLUDED_KEY = "excluded_paths"  # {folder_id: local rel path it would occupy}
 
 
 class SyncError(RuntimeError):
@@ -78,11 +80,14 @@ class SyncEngine:
         db: StateDB,
         root: Path,
         *,
+        remote_root_id: str | None = None,
         excluded: Iterable[str] = (),
         rules: IgnoreRules | None = None,
         settle_s: float = 3.0,
         mass_delete_limit: int = 100,
+        name: str = "",
     ):
+        self.name = name
         self.client = client
         self.db = db
         self.root = Path(root).expanduser().resolve()
@@ -95,7 +100,12 @@ class SyncEngine:
         recorded = db.get("sync_root")
         if recorded and recorded != str(self.root):
             raise SyncError(f"State DB belongs to {recorded!r}, not {str(self.root)!r}.")
-        self.root_id = db.get("root_id") or client.root_id()
+        recorded_id = db.get("root_id")
+        if remote_root_id in (None, "root"):
+            remote_root_id = recorded_id or client.root_id()
+        if recorded_id and recorded_id != remote_root_id:
+            raise SyncError("State DB belongs to a different Drive folder.")
+        self.root_id = remote_root_id
         db.set("root_id", self.root_id)
         # Set when we create untracked local files (conflicted copies) that the
         # next local pass needs to upload.
@@ -181,11 +191,24 @@ class SyncEngine:
         token = self.db.page_token
         if token is None:
             raise SyncError("No change-feed position yet; run `gdrivesync pull` first.")
-        self._stats = PassStats()
         changes, new_token = self.client.changes_since(token)
+        return self.apply_changes(changes, new_token)
+
+    def apply_changes(self, changes: list[dict], new_token: str) -> PassStats:
+        """Apply a batch from the Drive change feed (which may be shared between
+        pairs — anything outside this pair's folder is ignored)."""
+        self._stats = PassStats()
         latest: dict[str, dict | None] = {}
         for c in changes:
             latest[c["fileId"]] = None if c.get("removed") else c.get("file")
+        if self.root_id in latest:
+            r = latest.pop(self.root_id)
+            if r is None or r.get("trashed"):
+                # Don't mirror a whole-folder deletion; make the user decide.
+                raise SyncError(
+                    f"The Drive folder for {self.name or self.root} was deleted or trashed. "
+                    "Restore it on Drive, or remove this pair."
+                )
         for fid in json.loads(self.db.get(RETRY_KEY) or "[]"):
             if fid not in latest:
                 latest[fid] = self.client.get_file(fid)
@@ -240,6 +263,16 @@ class SyncEngine:
             and f.get("parents")
         ):
             parent_rel = self._parent_rel(f["parents"][0])
+
+        if fid in self.excluded:
+            alive = f is not None and not f.get("trashed") and f.get("parents")
+            if item is None:
+                if alive:
+                    self._track_excluded_location(f)  # follow renames/moves
+            elif not alive:
+                self._remote_removed(item)
+            # else: still synced locally; reconcile_exclusions() drops it safely
+            return
 
         if parent_rel is None:  # deleted, trashed, or moved out of My Drive
             if item:
@@ -364,14 +397,90 @@ class SyncEngine:
         self.db.upsert(make_item(f, rel, self._download(f, rel)))
         self._ok(rel)
 
+    # ================================================================ exclusions
+
+    def _excluded_paths(self) -> dict[str, str]:
+        return json.loads(self.db.get(EXCLUDED_KEY) or "{}")
+
+    def _save_excluded_paths(self, paths: dict[str, str]) -> None:
+        self.db.set(EXCLUDED_KEY, json.dumps(paths))
+
+    def _track_excluded_location(self, f: dict) -> None:
+        paths = self._excluded_paths()
+        parent_rel = self._parent_rel(f["parents"][0])
+        if parent_rel is None:
+            paths.pop(f["id"], None)
+        else:
+            paths[f["id"]] = self._local_name(f, parent_rel)
+        self._save_excluded_paths(paths)
+
+    def reconcile_exclusions(self) -> None:
+        """Bring the local tree in line with the excluded-folder list:
+        newly excluded folders are removed locally (their content is safe on
+        Drive), newly re-included ones are downloaded."""
+        paths = self._excluded_paths()
+        changed = False
+        for fid in self.excluded:
+            item = self.db.by_id(fid)
+            if item is not None:
+                if item.is_folder and self._drop_excluded_folder(item):
+                    paths[fid] = item.rel_path
+                    changed = True
+            elif fid not in paths:
+                f = self.client.get_file(fid)
+                if f and f.get("parents") and self._parent_rel(f["parents"][0]) is not None:
+                    paths[fid] = self._local_name(f, self._parent_rel(f["parents"][0]))
+                    changed = True
+        for fid in [k for k in paths if k not in self.excluded]:
+            del paths[fid]
+            changed = True
+            f = self.client.get_file(fid)
+            if f is not None:
+                log.info("re-including %s", f.get("name", fid))
+                self._apply_remote_one(fid, f)  # downloads the folder and its contents
+        if changed:
+            self._save_excluded_paths(paths)
+
+    def _drop_excluded_folder(self, item: Item) -> bool:
+        """Remove a newly excluded folder's local copy. Returns False (try again
+        later) if it holds anything not yet on Drive."""
+        base = self._abs(item.rel_path)
+        tracked = {it.rel_path: it for it in self.db.descendants(item.rel_path)}
+        local = scan(base, self.rules) if base.is_dir() else {}
+        for sub, st in local.items():
+            rel = f"{item.rel_path}/{sub}"
+            it = tracked.get(rel)
+            pending = (
+                it is None
+                or (not it.is_folder and not is_dir_stat(st) and not unchanged_since(it, st))
+            )
+            if pending:
+                log.warning(
+                    "not excluding %s yet: %s has changes that aren't on Drive yet",
+                    item.rel_path, rel,
+                )
+                return False
+        if base.exists():
+            shutil.rmtree(base)
+        for it in tracked.values():
+            self.db.delete(it.file_id)
+        self.db.delete(item.file_id)
+        log.info("excluded %s: removed local copy (still on Drive)", item.rel_path)
+        return True
+
     # ================================================================ local → remote
 
     def local_pass(self) -> PassStats:
         self._stats = PassStats()
         if not self.root.is_dir():
             raise SyncError(f"Sync folder {self.root} is missing; not syncing deletions.")
+        self._guard("(excluded folders)", self.reconcile_exclusions)
         now = time.time()
         found = scan(self.root, self.rules)
+        # Never upload into an excluded folder's place.
+        for ex in self._excluded_paths().values():
+            for rel in [r for r in found if r == ex or r.startswith(ex + "/")]:
+                del found[rel]
         tracked = {it.rel_path: it for it in self.db.all()}
 
         def settled(st: os.stat_result) -> bool:

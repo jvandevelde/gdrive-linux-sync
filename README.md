@@ -3,7 +3,8 @@
 Dropbox-style Google Drive sync for Ubuntu, with Nautilus integration.
 Personal project — see [docs/DESIGN.md](docs/DESIGN.md).
 
-**Status:** milestone 2 done — two-way sync as a background service. Nautilus integration is next.
+**Status:** milestone 2 done — two-way sync of one or more folder pairs as a background
+service. Nautilus integration is next.
 
 ## Setup
 
@@ -15,15 +16,17 @@ Personal project — see [docs/DESIGN.md](docs/DESIGN.md).
    ```sh
    pipx install -e .        # or: python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
    ```
-3. Use:
+3. Choose what to sync — one or more **pairs** of local folder ⇄ Drive folder:
    ```sh
    gdrivesync login
-   gdrivesync whoami
-   gdrivesync ls            # list My Drive root
-   gdrivesync config --sync-root ~/GoogleDrive
-   gdrivesync pull --dry-run   # preview
-   gdrivesync pull             # mirror My Drive locally (safe to re-run)
-   gdrivesync sync             # one two-way pass, then exit
+   gdrivesync ls /                              # browse Drive (ls /Work, ls <id>, …)
+   gdrivesync pair add ~/'Google Drive' /       # all of My Drive…
+   # …or separate folders instead (pairs can't overlap):
+   gdrivesync pair add ~/Work /Work
+   gdrivesync pair add ~/Pictures/Phone /Photos/Phone --create
+   gdrivesync pair list
+   gdrivesync pull --dry-run                    # preview the first download
+   gdrivesync sync                              # one two-way pass for every pair, then exit
    ```
 4. Run it in the background:
    ```sh
@@ -41,13 +44,27 @@ Personal project — see [docs/DESIGN.md](docs/DESIGN.md).
 
 ## What `pull` does
 
-- Mirrors My Drive into the sync folder (default `~/Google Drive`), 4 downloads in parallel,
+- Mirrors each pair's Drive folder into its local folder, 4 downloads in parallel,
   verifying each file's MD5 and setting its modified time to Drive's.
 - Google Docs/Sheets/Slides become small `.gdoc`/`.gsheet`/`.gslides` JSON files with the link.
 - Re-running is cheap: unchanged files are skipped, renames/moves on Drive become local renames.
 - A local file that differs from Drive is **never overwritten** — it's renamed to
   `name (conflicted copy <date>).ext` and the Drive version is downloaded.
 - `pull` itself is download-only; `sync` / the service do both directions.
+
+## Configuration
+
+| What | How |
+|---|---|
+| Folders to sync | `gdrivesync pair add/remove/list` |
+| Skip a subfolder (selective sync) | `gdrivesync exclude add ~/Google\ Drive/Videos` — removes the local copy on the next sync (it stays on Drive; waits for any not-yet-uploaded changes inside first). `exclude remove <path>` brings it back, `exclude list` shows them. |
+| Ignore files by pattern | `~/.config/gdrivesync/ignore` (gitignore-style) |
+| How often to check Drive | `gdrivesync config --poll-interval 30` (seconds, default 45) |
+| Parallel downloads in `pull` | `gdrivesync config --max-transfers 8` |
+
+Everything lives in `~/.config/gdrivesync/settings.json`; restart the service after
+changes (`systemctl --user restart gdrivesync`). Older single-folder configs are
+migrated automatically to a pair called "My Drive".
 
 ## How two-way sync behaves
 

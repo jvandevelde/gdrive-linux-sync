@@ -1,7 +1,11 @@
-"""Background sync service: file watcher + Drive change polling around SyncEngine.
+"""Background sync service: file watcher + Drive change polling around one
+SyncEngine per folder pair.
 
-All sync work happens on one thread (the loop in ``run``), so the engine and
-the SQLite DB never see concurrent access. The watchdog thread only enqueues.
+All sync work happens on one thread (the loop in ``run``), so engines and their
+SQLite DBs never see concurrent access. The watchdog thread only enqueues.
+
+Drive's change feed is account-wide, so pairs at the same feed position share a
+single ``changes.list`` call; each engine ignores changes outside its folder.
 """
 
 from __future__ import annotations
@@ -12,6 +16,8 @@ import queue
 import signal
 import threading
 import time
+from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
@@ -30,7 +36,8 @@ MAX_BACKOFF_S = 300.0
 
 
 class _Handler(FileSystemEventHandler):
-    def __init__(self, root: Path, q: queue.Queue):
+    def __init__(self, index: int, root: Path, q: queue.Queue):
+        self.index = index
         self.root = str(root)
         self.q = q
 
@@ -49,13 +56,42 @@ class _Handler(FileSystemEventHandler):
         if src is None and dest is None:
             return
         if event.event_type == "moved" and src and dest:
-            self.q.put(("move", src, dest))
-        self.q.put(("dirty", None, None))
+            self.q.put(("move", self.index, (src, dest)))
+        self.q.put(("dirty", self.index, None))
+
+
+@dataclass
+class _Slot:
+    engine: SyncEngine
+    first_dirty: float | None = None
+    last_event: float | None = None
+    moves: list[tuple[str, str]] = field(default_factory=list)
+
+    def mark(self, now: float) -> None:
+        self.last_event = now
+        self.first_dirty = self.first_dirty or now
+
+    def due(self, now: float) -> bool:
+        return self.first_dirty is not None and (
+            now - self.last_event >= DEBOUNCE_S or now - self.first_dirty >= MAX_DELAY_S
+        )
+
+    def deadline(self) -> float | None:
+        if self.first_dirty is None:
+            return None
+        return min(self.last_event + DEBOUNCE_S, self.first_dirty + MAX_DELAY_S)
 
 
 class Daemon:
-    def __init__(self, engine: SyncEngine, *, poll_interval_s: float = 45.0, watch: bool = True):
-        self.engine = engine
+    def __init__(
+        self, engines: list[SyncEngine] | SyncEngine, *, poll_interval_s: float = 45.0, watch: bool = True
+    ):
+        if isinstance(engines, SyncEngine):
+            engines = [engines]
+        if not engines:
+            raise ValueError("no folder pairs to sync")
+        self.slots = [_Slot(e) for e in engines]
+        self.client = engines[0].client
         self.poll_interval_s = poll_interval_s
         self.watch = watch
         self.q: queue.Queue = queue.Queue()
@@ -72,13 +108,15 @@ class Daemon:
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: self.stop())
 
-    # ---------------------------------------------------------------- loop
+    # ---------------------------------------------------------------- pieces
     def _start_watcher(self) -> bool:
         if not self.watch:
             return False
         try:
             self._observer = Observer()
-            self._observer.schedule(_Handler(self.engine.root, self.q), str(self.engine.root), recursive=True)
+            for i, slot in enumerate(self.slots):
+                root = slot.engine.root
+                self._observer.schedule(_Handler(i, root, self.q), str(root), recursive=True)
             self._observer.start()
             return True
         except OSError as e:
@@ -97,38 +135,81 @@ class Daemon:
             log.exception("%s failed", what)
             return None
 
+    def _label(self, eng: SyncEngine) -> str:
+        return eng.name or str(eng.root)
+
+    def _local(self, slot: _Slot, now: float) -> None:
+        eng = slot.engine
+        slot.first_dirty = slot.last_event = None
+        for src, dest in slot.moves:
+            self._safe(f"[{self._label(eng)}] move", eng.local_move_event, src, dest)
+        slot.moves.clear()
+        stats = self._safe(f"[{self._label(eng)}] local sync", eng.local_pass)
+        if stats and stats.changed:
+            log.info("[%s] local: %s", self._label(eng), _summary(stats))
+        if (stats and stats.deferred) or eng.dirty:
+            eng.dirty = False
+            slot.first_dirty = slot.last_event = now + eng.settle_s - DEBOUNCE_S
+
+    def poll_remote(self) -> bool:
+        """One Drive change-feed poll for every pair. Returns False on any failure."""
+        groups: dict[str | None, list[_Slot]] = defaultdict(list)
+        for slot in self.slots:
+            groups[slot.engine.db.page_token].append(slot)
+        ok = True
+        for token, slots in groups.items():
+            if token is None:
+                continue
+            try:
+                changes, new_token = self.client.changes_since(token)
+            except Exception:  # noqa: BLE001
+                log.exception("polling Drive failed")
+                ok = False
+                continue
+            for slot in slots:
+                eng = slot.engine
+                stats = self._safe(f"[{self._label(eng)}] remote sync", eng.apply_changes, changes, new_token)
+                if stats is None:
+                    ok = False
+                elif stats.changed:
+                    log.info("[%s] Drive: %s", self._label(eng), _summary(stats))
+                if eng.dirty:
+                    eng.dirty = False
+                    slot.mark(time.monotonic())
+        return ok
+
+    # ---------------------------------------------------------------- loop
     def run(self) -> None:
-        eng = self.engine
         watching = self._start_watcher()
         full_scan_every = FULL_SCAN_S if watching else FULL_SCAN_NO_WATCH_S
-        log.info("Syncing %s (watching=%s, poll every %ss)", eng.root, watching, self.poll_interval_s)
+        for s in self.slots:
+            log.info("Syncing %s ⇄ Drive %s", s.engine.root, self._label(s.engine))
+        log.info("watching=%s, polling Drive every %ss", watching, self.poll_interval_s)
 
         now = time.monotonic()
-        next_remote = now  # poll Drive right away
+        next_remote = now
         next_full = now + full_scan_every
-        first_dirty: float | None = now  # scan once at startup to catch offline changes
-        last_event: float | None = now - DEBOUNCE_S
-        moves: list[tuple[str, str]] = []
+        for s in self.slots:  # scan once at startup to catch offline changes
+            s.first_dirty, s.last_event = now, now - DEBOUNCE_S
         remote_failures = 0
 
         try:
             while not self._stop.is_set():
                 now = time.monotonic()
-                deadlines = [next_remote, next_full]
-                if first_dirty is not None:
-                    deadlines.append(min(last_event + DEBOUNCE_S, first_dirty + MAX_DELAY_S))
+                deadlines = [next_remote, next_full] + [
+                    d for d in (s.deadline() for s in self.slots) if d is not None
+                ]
                 timeout = max(0.0, min(min(deadlines) - now, 1.0))
                 try:
                     item = self.q.get(timeout=timeout)
                     while True:
-                        kind, a, b = item
+                        kind, idx, payload = item
                         if kind == "stop":
                             return
+                        slot = self.slots[idx]
                         if kind == "move":
-                            moves.append((a, b))
-                        now = time.monotonic()
-                        last_event = now
-                        first_dirty = first_dirty or now
+                            slot.moves.append(payload)
+                        slot.mark(time.monotonic())
                         item = self.q.get_nowait()
                 except queue.Empty:
                     pass
@@ -137,39 +218,24 @@ class Daemon:
                     continue
                 now = time.monotonic()
 
-                if first_dirty is not None and (
-                    now - last_event >= DEBOUNCE_S or now - first_dirty >= MAX_DELAY_S
-                ):
-                    first_dirty = last_event = None
-                    for src, dest in moves:
-                        self._safe("move", eng.local_move_event, src, dest)
-                    moves.clear()
-                    stats = self._safe("local sync", eng.local_pass)
-                    if stats and stats.changed:
-                        log.info("local pass: %s", _summary(stats))
-                    if (stats and stats.deferred) or eng.dirty:
-                        eng.dirty = False
-                        first_dirty = last_event = now + eng.settle_s - DEBOUNCE_S
+                for slot in self.slots:
+                    if slot.due(now):
+                        self._local(slot, now)
 
                 if now >= next_remote:
-                    stats = self._safe("remote sync", eng.remote_pass)
-                    if stats is None:
-                        remote_failures += 1
-                        delay = min(MAX_BACKOFF_S, 15.0 * 2 ** (remote_failures - 1))
-                    else:
+                    if self.poll_remote():
                         remote_failures = 0
                         delay = self.poll_interval_s
-                        if stats.changed:
-                            log.info("remote pass: %s", _summary(stats))
+                    else:
+                        remote_failures += 1
+                        delay = min(MAX_BACKOFF_S, 15.0 * 2 ** (remote_failures - 1))
                     next_remote = time.monotonic() + delay
-                    if eng.dirty:
-                        eng.dirty = False
-                        first_dirty = last_event = time.monotonic()
 
                 if now >= next_full:
                     next_full = now + full_scan_every
-                    first_dirty = first_dirty or now
-                    last_event = last_event or now - DEBOUNCE_S
+                    for slot in self.slots:
+                        if slot.first_dirty is None:
+                            slot.first_dirty, slot.last_event = now, now - DEBOUNCE_S
         finally:
             if self._observer:
                 self._observer.stop()

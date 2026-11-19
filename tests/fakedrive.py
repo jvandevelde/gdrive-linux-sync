@@ -130,6 +130,21 @@ class FakeDrive:
     def list_all(self):
         return [copy.deepcopy(f) for f in self.files.values() if not f["trashed"]]
 
+    def list_trashed(self):
+        out = []
+        for f in self.files.values():
+            g, trashed = f, False
+            while g is not None:  # trashed itself, or inside a trashed folder
+                if g["trashed"]:
+                    trashed = True
+                    break
+                g = self.files.get((g.get("parents") or [None])[0])
+            if trashed:
+                t = copy.deepcopy(f)
+                t["trashed"] = True
+                out.append(t)
+        return out
+
     def list_children(self, folder_id):
         return [
             copy.deepcopy(f) for f in self.files.values()

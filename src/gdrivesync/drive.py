@@ -135,6 +135,10 @@ class DriveClient:
         me") are ignored. Includes others' files inside my folders."""
         yield from self._paged_files("trashed = false")
 
+    def list_trashed(self) -> Iterator[dict]:
+        """Everything currently in Drive's trash (kept there ~30 days)."""
+        yield from self._paged_files("trashed = true")
+
     def _paged_files(self, q: str) -> Iterator[dict]:
         token = None
         while True:

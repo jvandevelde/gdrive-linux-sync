@@ -75,6 +75,10 @@ class Settings:
     poll_interval_s: int = 45
     max_transfers: int = 4
     full_check_hours: float = 24  # compare everything with Drive this often (0 = never)
+    # When rebuilding sync state (or first-syncing an existing folder), a local
+    # file that differs from Drive and is newer is uploaded as a new version
+    # instead of being kept as a conflicted copy.
+    prefer_newer_on_rebuild: bool = False
     pairs: list[Pair] = field(default_factory=list)
 
     @classmethod
@@ -84,6 +88,7 @@ class Settings:
             poll_interval_s=data.get("poll_interval_s", cls.poll_interval_s),
             max_transfers=data.get("max_transfers", cls.max_transfers),
             full_check_hours=data.get("full_check_hours", cls.full_check_hours),
+            prefer_newer_on_rebuild=data.get("prefer_newer_on_rebuild", cls.prefer_newer_on_rebuild),
             pairs=[Pair(**p) for p in data.get("pairs", [])],
         )
         if "pairs" not in data and ("sync_root" in data or STATE_DB.exists()):

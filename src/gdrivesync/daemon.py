@@ -26,6 +26,7 @@ from watchdog.observers import Observer
 from gdrivesync.config import TMP_DIRNAME
 from gdrivesync.drive import InvalidPageToken
 from gdrivesync.engine import FULL_CHECK_KEY, SyncEngine
+from gdrivesync.state import is_corruption
 
 log = logging.getLogger("gdrivesync.daemon")
 
@@ -67,6 +68,7 @@ class _Slot:
     first_dirty: float | None = None
     last_event: float | None = None
     moves: list[tuple[str, str]] = field(default_factory=list)
+    disabled: bool = False  # state DB unusable and couldn't be rebuilt
 
     def mark(self, now: float) -> None:
         self.last_event = now
@@ -91,7 +93,12 @@ class Daemon:
         poll_interval_s: float = 45.0,
         full_check_s: float = 24 * 3600,
         watch: bool = True,
+        rebuild=None,
     ):
+        """``rebuild(engine) -> engine`` is called when a pair's state DB turns
+        out to be corrupt while running; it should quarantine the DB and return
+        a freshly rebuilt engine for the same pair."""
+        self.rebuild = rebuild
         if isinstance(engines, SyncEngine):
             engines = [engines]
         if not engines:
@@ -135,12 +142,35 @@ class Daemon:
             self._observer = None
             return False
 
-    def _safe(self, what: str, fn, *args):
+    def _safe(self, what: str, fn, *args, slot: "_Slot | None" = None):
         try:
             return fn(*args)
-        except Exception:  # noqa: BLE001 — keep the service alive
-            log.exception("%s failed", what)
+        except Exception as e:  # noqa: BLE001 — keep the service alive
+            if slot is not None and is_corruption(e):
+                self._handle_corruption(slot, e)
+            else:
+                log.exception("%s failed", what)
             return None
+
+    def _handle_corruption(self, slot: "_Slot", e: Exception) -> None:
+        eng = slot.engine
+        log.error("[%s] sync state is corrupted (%s); rebuilding it", self._label(eng), e)
+        if self.rebuild is None:
+            slot.disabled = True
+            log.error("[%s] paused: restart the service to rebuild", self._label(eng))
+            return
+        try:
+            slot.engine = self.rebuild(eng)
+        except Exception:  # noqa: BLE001
+            slot.disabled = True
+            log.exception("[%s] rebuild failed; this folder is paused until restart",
+                          self._label(eng))
+            return
+        log.warning("[%s] rebuilt sync state; continuing", self._label(slot.engine))
+        slot.mark(time.monotonic())
+
+    def _active(self) -> list["_Slot"]:
+        return [s for s in self.slots if not s.disabled]
 
     def _label(self, eng: SyncEngine) -> str:
         return eng.name or str(eng.root)
@@ -149,9 +179,9 @@ class Daemon:
         eng = slot.engine
         slot.first_dirty = slot.last_event = None
         for src, dest in slot.moves:
-            self._safe(f"[{self._label(eng)}] move", eng.local_move_event, src, dest)
+            self._safe(f"[{self._label(eng)}] move", eng.local_move_event, src, dest, slot=slot)
         slot.moves.clear()
-        stats = self._safe(f"[{self._label(eng)}] local sync", eng.local_pass)
+        stats = self._safe(f"[{self._label(eng)}] local sync", eng.local_pass, slot=slot)
         if stats and stats.changed:
             log.info("[%s] local: %s", self._label(eng), _summary(stats))
         if (stats and stats.deferred) or eng.dirty:
@@ -161,8 +191,9 @@ class Daemon:
     def poll_remote(self) -> bool:
         """One Drive change-feed poll for every pair. Returns False on any failure."""
         groups: dict[str | None, list[_Slot]] = defaultdict(list)
-        for slot in self.slots:
-            groups[slot.engine.db.page_token].append(slot)
+        for slot in self._active():
+            groups[self._safe("read state", lambda e=slot.engine: e.db.page_token, slot=slot)
+                   ].append(slot)
         ok = True
         for token, slots in groups.items():
             if token is None:
@@ -173,7 +204,8 @@ class Daemon:
                 # Detected a rejected feed position: recover each affected pair.
                 for slot in slots:
                     eng = slot.engine
-                    stats = self._safe(f"[{self._label(eng)}] recovery", eng.recover_feed, e)
+                    stats = self._safe(f"[{self._label(eng)}] recovery", eng.recover_feed, e,
+                                       slot=slot)
                     if stats is None:
                         ok = False
                     else:
@@ -189,7 +221,8 @@ class Daemon:
                 continue
             for slot in slots:
                 eng = slot.engine
-                stats = self._safe(f"[{self._label(eng)}] remote sync", eng.apply_changes, changes, new_token)
+                stats = self._safe(f"[{self._label(eng)}] remote sync", eng.apply_changes,
+                                   changes, new_token, slot=slot)
                 if stats is None:
                     ok = False
                 elif stats.changed:
@@ -205,9 +238,12 @@ class Daemon:
         if self.full_check_s <= 0:
             return
         now = time.time()
-        for slot in self.slots:
+        for slot in self._active():
             eng = slot.engine
-            last = float(eng.db.get(FULL_CHECK_KEY) or 0)
+            raw = self._safe("read state", eng.db.get, FULL_CHECK_KEY, slot=slot)
+            if slot.engine is not eng or slot.disabled:
+                continue  # was just rebuilt / paused
+            last = float(raw or 0)
             if now - last < self.full_check_s:
                 continue
             if last == 0:
@@ -215,7 +251,7 @@ class Daemon:
                 # re-listing Drive right after a full download.
                 eng.db.set(FULL_CHECK_KEY, str(now))
                 continue
-            stats = self._safe(f"[{self._label(eng)}] full check", eng.full_check)
+            stats = self._safe(f"[{self._label(eng)}] full check", eng.full_check, slot=slot)
             if stats is None:
                 continue
             if stats.changed or stats.errors:
@@ -267,7 +303,7 @@ class Daemon:
                     continue
                 now = time.monotonic()
 
-                for slot in self.slots:
+                for slot in self._active():
                     if slot.due(now):
                         self._local(slot, now)
 
@@ -284,7 +320,7 @@ class Daemon:
 
                 if now >= next_full:
                     next_full = now + full_scan_every
-                    for slot in self.slots:
+                    for slot in self._active():
                         if slot.first_dirty is None:
                             slot.first_dirty, slot.last_event = now, now - DEBOUNCE_S
         finally:

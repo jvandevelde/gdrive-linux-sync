@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import posixpath
 import shutil
 from collections import defaultdict
 from collections.abc import Callable, Iterable
@@ -19,9 +20,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
-from gdrivesync.config import TMP_DIRNAME
+from gdrivesync.config import BUILTIN_IGNORES, TMP_DIRNAME
 from gdrivesync.drive import FOLDER_MIME, SHORTCUT_MIME, is_google_doc
-from gdrivesync.names import dedupe, stub_name, to_local
+from gdrivesync.localfs import IgnoreRules, is_dir_stat, scan, trash_local
+from gdrivesync.names import DEFAULT_STUB_EXT, DOC_STUB_EXT, dedupe, stub_name, to_local, to_remote
 from gdrivesync.state import Item, StateDB
 
 
@@ -50,6 +52,11 @@ class PullResult:
     forgotten: int = 0  # DB rows no longer present remotely
     conflicts: list[str] = field(default_factory=list)  # conflicted-copy paths
     errors: list[tuple[str, str]] = field(default_factory=list)  # (path, message)
+    # Rebuild / first sync into an existing folder (no prior sync state):
+    newer_local: list[str] = field(default_factory=list)  # local newer → uploaded as new version
+    deleted_on_drive: list[str] = field(default_factory=list)  # found in Drive's trash → local trash
+    orphan_links: list[str] = field(default_factory=list)  # .gdoc etc. to docs no longer here
+    local_only: list[str] = field(default_factory=list)  # not on Drive → uploaded by the next sync
 
 
 @dataclass
@@ -119,7 +126,10 @@ def list_subtree(client: DriveLike, folder_id: str, excluded: Iterable[str] = ()
 
 
 def build_tree(
-    files: Iterable[dict], root_id: str, excluded: Iterable[str] = ()
+    files: Iterable[dict],
+    root_id: str,
+    excluded: Iterable[str] = (),
+    excluded_rels: list[str] | None = None,
 ) -> tuple[list[tuple[dict, str]], int]:
     """Walk My Drive from the root. Returns ([(file, rel_path)] parents-first,
     number of skipped shortcuts). Local names are made safe and unique per folder;
@@ -145,12 +155,14 @@ def build_tree(
             if mime == SHORTCUT_MIME:
                 skipped += 1
                 continue
-            if f["id"] in excluded:
-                continue
             local = stub_name(f["name"], mime) if is_google_doc(mime) else to_local(f["name"])
             local = dedupe(local, taken)
             taken.add(local)
             rel = f"{prefix}/{local}" if prefix else local
+            if f["id"] in excluded:
+                if excluded_rels is not None:
+                    excluded_rels.append(rel)
+                continue
             out.append((f, rel))
             if mime == FOLDER_MIME:
                 stack.append((f["id"], rel))
@@ -172,7 +184,17 @@ def pull(
     log: Callable[[str], None] = print,
     oplog=None,
     pair: str = "",
+    prefer_newer: bool = False,
+    rules: IgnoreRules | None = None,
 ) -> PullResult:
+    """Download a Drive folder into root.
+
+    With no prior sync state for this pair (first sync, or a rebuild after the
+    state DB was lost), existing local files are reconciled instead of blindly
+    trusted: identical files are adopted, differing ones become conflicted
+    copies (or, with prefer_newer, a newer local file is queued for upload as a
+    new version), local files found in Drive's trash are moved to the local
+    trash, and orphaned Google-Docs links are removed."""
     def rec(op: str, path: str, **detail) -> None:
         if oplog is not None and not dry_run:
             oplog.record(op, path, pair=pair, **detail)
@@ -186,6 +208,7 @@ def pull(
         )
 
     res = PullResult()
+    rebuilding = db.page_token is None and not db.all()
 
     # Grab the change-feed position *before* listing so nothing that changes
     # during the (possibly long) listing is missed later.
@@ -202,7 +225,8 @@ def pull(
     else:
         log("Listing folder…")
         listing = list_subtree(client, root_id, excluded)
-    entries, res.skipped = build_tree(listing, root_id, excluded)
+    excluded_rels: list[str] = []
+    entries, res.skipped = build_tree(listing, root_id, excluded, excluded_rels)
     log(f"Found {len(entries)} items.")
 
     tmp = root / TMP_DIRNAME
@@ -241,7 +265,7 @@ def pull(
             else:
                 if f.get("capabilities", {}).get("canDownload") is False:
                     raise PullError("Drive does not allow downloading this file")
-                job = _plan_file(f, rel, dest, root, db, res, dry_run, log, rec)
+                job = _plan_file(f, rel, dest, root, db, res, dry_run, log, rec, prefer_newer)
                 if job:
                     downloads.append(job)
         except (OSError, PullError) as e:
@@ -257,6 +281,12 @@ def pull(
             raise PullError(
                 f"Not enough disk space: need {need / 1e9:.2f} GB, {free / 1e9:.2f} GB free."
             )
+
+    if rebuilding and root.is_dir():
+        _reconcile_existing(
+            client, root, root_id, entries, excluded_rels,
+            rules or IgnoreRules(BUILTIN_IGNORES), res, dry_run, log, rec,
+        )
 
     if dry_run:
         for d in downloads:
@@ -348,6 +378,7 @@ def _plan_file(
     dry_run: bool,
     log: Callable[[str], None],
     rec: Callable[..., None] = lambda *a, **k: None,
+    prefer_newer: bool = False,
 ) -> _Download | None:
     """Decide what to do for a binary file. Returns a download job or None."""
     prev = db.by_id(f["id"])
@@ -370,6 +401,22 @@ def _plan_file(
         # Remote changed and the local copy is the untouched previous version: overwrite.
         if prev and prev.rel_path == rel and unchanged_since(prev, st):
             return _Download(f, rel)
+        # No sync history and the local file is clearly newer: keep it and let the
+        # next sync upload it as a new version (Drive keeps the old one in its
+        # version history).
+        if (
+            prefer_newer
+            and prev is None
+            and f.get("modifiedTime")
+            and st.st_mtime > rfc3339_to_ts(f["modifiedTime"]) + NEWER_MARGIN_S
+        ):
+            log(f"local is newer: {rel} (will upload it as a new version)")
+            if not dry_run:
+                item = make_item(f, rel, st)
+                item.local_mtime_ns = -1  # never matches → the engine compares and uploads
+                db.upsert(item)
+            res.newer_local.append(rel)
+            return None
         # Local content differs and wasn't produced by us: keep it as a conflicted copy.
         backup = conflict_name(dest)
         log(f"conflict: {rel} -> {backup.name}")
@@ -392,6 +439,79 @@ def _plan_file(
             return None
 
     return _Download(f, rel)
+
+
+NEWER_MARGIN_S = 2.0
+STUB_EXTS = tuple(set(DOC_STUB_EXT.values()) | {DEFAULT_STUB_EXT})
+
+
+def _reconcile_existing(
+    client, root, root_id, entries, excluded_rels, rules, res, dry_run, log, rec
+) -> None:
+    """Classify local files that aren't on Drive (only meaningful when there is no
+    sync history: a first sync into an existing folder, or a rebuild)."""
+    rel_to_id = {rel: f["id"] for f, rel in entries}
+    rel_to_id[""] = root_id
+    tree_ids = set(rel_to_id.values())
+
+    def excluded_path(rel: str) -> bool:
+        return any(rel == e or rel.startswith(e + "/") for e in excluded_rels)
+
+    found = {r: st for r, st in scan(root, rules).items() if not excluded_path(r)}
+    removed: set[str] = set()
+
+    def remove(rel: str, reason: str, bucket: list[str]) -> None:
+        bucket.append(rel)
+        removed.add(rel)
+        log(f"{'would move' if dry_run else 'moving'} local {rel} to trash — {reason}")
+        if not dry_run:
+            trash_local(root / rel)
+            rec("trash_local", rel, reason=reason)
+
+    # 1. Google-Docs links pointing at documents that aren't in this folder any more.
+    for rel, st in found.items():
+        if rel in rel_to_id or is_dir_stat(st) or not rel.endswith(STUB_EXTS):
+            continue
+        sid = read_stub_id(root / rel)
+        if sid and sid not in tree_ids:
+            remove(rel, "link to a Google Doc that's no longer here", res.orphan_links)
+
+    local_only = sorted(
+        (r for r in found if r not in rel_to_id and r not in removed),
+        key=lambda r: (r.count("/"), r),
+    )
+    if not local_only:
+        return
+
+    # 2. Files deleted on Drive while there was no sync state: they're in Drive's
+    #    trash (for ~30 days) with the same folder, name and content.
+    trashed: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for t in client.list_trashed():
+        for p in (t.get("parents") or [])[:1]:
+            trashed[(p, t["name"])].append(t)
+
+    trashed_dirs: dict[str, str] = {}  # local rel -> trashed Drive folder id
+    for rel in local_only:
+        parent = posixpath.dirname(rel)
+        pid = rel_to_id.get(parent) or trashed_dirs.get(parent)
+        cands = trashed.get((pid, to_remote(posixpath.basename(rel))), []) if pid else []
+        if is_dir_stat(found[rel]):
+            folder = next((c for c in cands if c["mimeType"] == FOLDER_MIME), None)
+            if folder:
+                trashed_dirs[rel] = folder["id"]
+            continue
+        if cands and any(c.get("md5Checksum") for c in cands):
+            h = md5_file(root / rel)
+            if any(c.get("md5Checksum") == h for c in cands):
+                remove(rel, "deleted on Drive (found in Drive's trash)", res.deleted_on_drive)
+                continue
+        res.local_only.append(rel)
+
+    # Folders deleted on Drive whose contents all matched: remove them too.
+    for rel in sorted(trashed_dirs, key=lambda r: r.count("/"), reverse=True):
+        rest = [r for r in found if r.startswith(rel + "/") and r not in removed]
+        if not rest:
+            remove(rel, "deleted on Drive (found in Drive's trash)", res.deleted_on_drive)
 
 
 def _run_downloads(

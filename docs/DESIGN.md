@@ -225,6 +225,27 @@ it isn't re-downloaded (the next local pass trashes it on Drive).
   after a successful poll, logging a warning if it found differences (drift the
   feed missed). The first check after a pull only starts the clock.
 
+### Sync-state loss, corruption and rebuild
+
+- `StateDB.open_checked()` runs `PRAGMA quick_check` before use. A damaged DB
+  (SQLITE_CORRUPT / SQLITE_NOTADB — not e.g. "locked") is renamed to
+  `*.corrupt-<ts>` with its -wal/-shm, and a fresh DB is returned. No page token
+  → the normal first-sync path runs, which doubles as the rebuild.
+- At runtime the daemon checks exceptions with `is_corruption()`; for that pair it
+  calls a `rebuild(engine)` callback (quarantine + rebuild + new engine) instead of
+  failing every pass. Without a callback, or if the rebuild fails, only that pair is
+  paused.
+- `pull()` with no sync history (first sync or rebuild) reconciles the existing
+  local tree (`_reconcile_existing`): orphaned Docs links are trashed locally;
+  local-only files that match an item in Drive's trash by (parent, name, MD5) — and
+  folders whose contents all matched — are moved to the local trash; the rest are
+  reported as local-only (uploaded by the next local pass). With `prefer_newer`, a
+  differing local file more than 2 s newer than Drive's `modifiedTime` is recorded
+  with Drive's metadata but `local_mtime_ns = -1`, so the engine's normal
+  "modified locally" path uploads it as a new revision of the same Drive file.
+- `PairLock` (flock on `<db>.lock`) is held by the service for its lifetime and by
+  every mutating CLI command, so `pair rebuild` can't swap a DB the service has open.
+
 ### Operation log and dry run
 
 All mutations in `SyncEngine` go through a small set of `_fx_*` methods

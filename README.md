@@ -82,6 +82,41 @@ through Drive's change feed within one poll interval. Two safety nets cover the 
   (`journalctl --user -u gdrivesync | grep "full check"`). `gdrivesync pair list` shows when
   each pair was last checked.
 
+## Lost or corrupted sync state
+
+The per-pair sync state lives in `~/.local/share/gdrivesync/pair-*.db`. If it's deleted
+(or you reinstall and wiped that folder), the service rebuilds it on start; if it's
+**corrupted**, that's detected when it's opened — or mid-run — and the damaged file is
+kept as `pair-*.db.corrupt-<date>` while the pair is rebuilt. No crash loops.
+
+A rebuild compares your local folder with Drive instead of downloading everything:
+
+| Local file… | Result |
+|---|---|
+| identical to Drive | kept (checksum match), not downloaded |
+| missing | downloaded |
+| different from Drive | kept as a conflicted copy, Drive's version downloaded — or, with *prefer newer*, uploaded as a new version if it's the newer one (Drive keeps the old version in its history) |
+| not on Drive, but in Drive's **trash** (same folder, name, content) | it was deleted on Drive → moved to your local trash, not re-uploaded |
+| not on Drive at all | uploaded by the next sync (listed first; Drive's trash is emptied after ~30 days, so older deletions can't be told apart from new files) |
+| a `.gdoc`-style link to a document that's gone | moved to your local trash |
+
+Rebuild by hand (stop the service first; the command refuses while it runs):
+
+```sh
+gdrivesync pair rebuild "My Drive" --dry-run        # preview
+gdrivesync pair rebuild "My Drive"                  # differing files → conflicted copies
+gdrivesync pair rebuild "My Drive" --prefer-newer   # newer local files → new versions on Drive
+gdrivesync config --prefer-newer-on-rebuild on      # use that for automatic rebuilds too
+```
+
+*Prefer newer* is off by default: it trusts file timestamps, and a restore with tools
+that reset them (e.g. `cp` without `-p`) would make old copies look newest. Drive's version
+history can undo it, but conflicted copies are the zero-risk option.
+
+The service and the commands that change things (`sync`, `pull`, `pair rebuild`,
+`pair remove`, `doctor --fix`) take a per-pair lock, so they never work on the same folder
+at once; read-only commands (`--dry-run`, `log`, `pair list`) always work.
+
 ## Dry run and operation log
 
 ```sh

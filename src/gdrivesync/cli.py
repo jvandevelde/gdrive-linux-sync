@@ -157,12 +157,55 @@ def cmd_pair_add(args: argparse.Namespace) -> int:
 def cmd_pair_remove(args: argparse.Namespace) -> int:
     settings = config.Settings.load()
     pair = _selected_pairs(settings, args.name)[0]
+    held = _locks([pair])
     settings.pairs.remove(pair)
     settings.save()
     for suffix in ("", "-wal", "-shm"):
         Path(str(pair.db_path) + suffix).unlink(missing_ok=True)
+    for lk in held:
+        lk.release()
+    Path(str(pair.db_path) + ".lock").unlink(missing_ok=True)
     print(f"Stopped syncing {pair.name!r}. Local files in {pair.root} and the Drive folder "
           f"were left untouched. {RESTART_HINT}")
+    return 0
+
+
+def cmd_pair_rebuild(args: argparse.Namespace) -> int:
+    """Throw away a pair's sync state and rebuild it by comparing the local folder
+    with Drive (checksums; nothing identical is downloaded again)."""
+    from gdrivesync.state import quarantine
+
+    settings = config.Settings.load()
+    pair = _selected_pairs(settings, args.name)[0]
+    prefer = settings.prefer_newer_on_rebuild if args.prefer_newer is None else args.prefer_newer
+    client = _client()
+    print(f"== Rebuilding {pair.name}: {pair.root} ⇄ Drive {pair.remote_path}"
+          + ("  (dry run)" if args.dry_run else ""))
+    if args.dry_run:
+        from gdrivesync.localfs import IgnoreRules
+        from gdrivesync.pull import pull
+        from gdrivesync.state import StateDB
+
+        res = pull(
+            client, StateDB(":memory:"), pair.root,
+            root_id=pair.remote_id, excluded=pair.excluded_folder_ids,
+            dry_run=True, prefer_newer=prefer, rules=IgnoreRules.load(),
+            log=lambda m: print("  " + m),
+        )
+        _print_pull(res, dry_run=True)
+        print("\nNothing was changed. Run without --dry-run to rebuild.")
+        return 0
+
+    held = _locks([pair])  # noqa: F841
+    old = quarantine(pair.db_path, "replaced")
+    res = _pull_pair(client, settings, pair, oplog=_oplog(), prefer_newer=prefer)
+    _print_pull(res, dry_run=False)
+    if old:
+        print(f"\nPrevious sync state kept as {old} (safe to delete).")
+    print(RESTART_HINT.replace("If the service is running", "If you stopped the service, start it"))
+    if res.errors:
+        print("Some items failed; run `gdrivesync pair rebuild` again to retry.", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -195,6 +238,53 @@ def cmd_exclude(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- syncing
 
 
+def _locks(pairs):
+    """Take the per-pair locks (fails if the service or another command holds one)."""
+    from gdrivesync.state import PairLock
+
+    held = []
+    try:
+        for p in pairs:
+            held.append(PairLock(p.db_path).acquire())
+    except Exception:
+        for lk in held:
+            lk.release()
+        raise
+    return held
+
+
+def _open_state(pair):
+    """Open a pair's state DB, moving a corrupted one aside (→ rebuild)."""
+    from gdrivesync.state import StateDB
+
+    db, moved = StateDB.open_checked(pair.db_path)
+    if moved:
+        print(f"[{pair.name}] sync state was corrupted; kept it as {moved.name} and rebuilding.",
+              file=sys.stderr)
+    return db
+
+
+def _dry_state(pair):
+    """A throwaway in-memory copy of a pair's state (fresh if missing or damaged)."""
+    from gdrivesync.state import StateDB, is_corruption
+
+    if not pair.db_path.exists():
+        return StateDB(":memory:")
+    try:
+        db = StateDB(pair.db_path)
+        try:
+            snap = db.snapshot()
+            snap.conn.execute("PRAGMA quick_check").fetchone()
+            return snap
+        finally:
+            db.close()
+    except Exception as e:  # noqa: BLE001
+        if not is_corruption(e):
+            raise
+        print(f"[{pair.name}] sync state is corrupted; showing a rebuild.", file=sys.stderr)
+        return StateDB(":memory:")
+
+
 def _print_pull(res, dry_run: bool) -> None:
     verb = "Would download" if dry_run else "Downloaded"
     print(
@@ -211,15 +301,39 @@ def _print_pull(res, dry_run: bool) -> None:
         print(f"{len(res.conflicts)} local files differed from Drive and were kept as:")
         for c in res.conflicts:
             print(f"  {c}")
+    would = "would be " if dry_run else ""
+    if res.newer_local:
+        print(f"{len(res.newer_local)} local files are newer than Drive and {would or 'will be '}"
+              "uploaded as new versions (Drive keeps the old version in its history):")
+        for p in res.newer_local:
+            print(f"  {p}")
+    if res.deleted_on_drive:
+        print(f"{len(res.deleted_on_drive)} local items were deleted on Drive (found in Drive's "
+              f"trash) and {would or 'were '}moved to your trash:")
+        for p in res.deleted_on_drive:
+            print(f"  {p}")
+    if res.orphan_links:
+        print(f"{len(res.orphan_links)} Google Docs links point at documents that are gone and "
+              f"{would or 'were '}moved to your trash:")
+        for p in res.orphan_links:
+            print(f"  {p}")
+    if res.local_only:
+        print(f"{len(res.local_only)} local files aren't on Drive and will be uploaded by the next "
+              "sync. Delete any you had deleted on Drive before that:")
+        for p in res.local_only[:50]:
+            print(f"  {p}")
+        if len(res.local_only) > 50:
+            print(f"  … and {len(res.local_only) - 50} more")
     for path, msg in res.errors:
         print(f"  error {path}: {msg}", file=sys.stderr)
 
 
-def _pull_pair(client, settings, pair, *, dry_run=False, log=print, oplog=None):
+def _pull_pair(client, settings, pair, *, dry_run=False, log=print, oplog=None,
+               prefer_newer=None):
+    from gdrivesync.localfs import IgnoreRules
     from gdrivesync.pull import pull
-    from gdrivesync.state import StateDB
 
-    db = StateDB(":memory:") if dry_run and not pair.db_path.exists() else StateDB(pair.db_path)
+    db = _dry_state(pair) if dry_run else _open_state(pair)
     try:
         return pull(
             client, db, pair.root,
@@ -230,6 +344,8 @@ def _pull_pair(client, settings, pair, *, dry_run=False, log=print, oplog=None):
             log=log,
             oplog=oplog,
             pair=pair.name,
+            prefer_newer=settings.prefer_newer_on_rebuild if prefer_newer is None else prefer_newer,
+            rules=IgnoreRules.load(),
         )
     finally:
         db.close()
@@ -239,7 +355,9 @@ def cmd_pull(args: argparse.Namespace) -> int:
     settings = config.Settings.load()
     client = _client()
     failed = False
-    for pair in _selected_pairs(settings, args.pair):
+    pairs = _selected_pairs(settings, args.pair)
+    held = [] if args.dry_run else _locks(pairs)
+    for pair in pairs:
         print(f"== {pair.name}: {pair.root} ⇄ Drive {pair.remote_path}")
         res = _pull_pair(
             client, settings, pair,
@@ -254,40 +372,48 @@ def cmd_pull(args: argparse.Namespace) -> int:
     return 2 if failed else 0
 
 
-def _engines(settings, pairs, client, oplog=None):
-    """One SyncEngine per pair, running the initial download for new pairs."""
+def _build_engine(settings, pair, client, oplog=None, rules=None):
+    """A SyncEngine for one pair. Runs the initial download first if the pair has
+    no sync state yet — which is also how lost or corrupted state is rebuilt."""
     from gdrivesync.engine import SyncEngine
     from gdrivesync.localfs import IgnoreRules
     from gdrivesync.pull import PullError
-    from gdrivesync.state import StateDB
+
+    db = _open_state(pair)
+    if db.page_token is None:
+        plog = logging.getLogger("gdrivesync.pull")
+        plog.info("[%s] no sync state: downloading / reconciling %s", pair.name, pair.remote_path)
+        db.close()
+        res = _pull_pair(client, settings, pair, log=plog.info, oplog=oplog)
+        for label, items in (("newer locally, will upload", res.newer_local),
+                             ("deleted on Drive, moved to trash", res.deleted_on_drive),
+                             ("orphaned Docs link, moved to trash", res.orphan_links),
+                             ("only local, will upload", res.local_only)):
+            for path in items:
+                plog.warning("[%s] %s: %s", pair.name, label, path)
+        if res.errors:
+            for path, msg in res.errors:
+                plog.error("[%s] %s: %s", pair.name, path, msg)
+            raise PullError(
+                f"Initial download of {pair.name!r} had {len(res.errors)} errors; re-run to retry."
+            )
+        db = _open_state(pair)
+    return SyncEngine(
+        client, db, pair.root,
+        remote_root_id=pair.remote_id,
+        excluded=pair.excluded_folder_ids,
+        rules=rules or IgnoreRules.load(),
+        name=pair.name,
+        oplog=oplog,
+    )
+
+
+def _engines(settings, pairs, client, oplog=None):
+    """One SyncEngine per pair, running the initial download for new pairs."""
+    from gdrivesync.localfs import IgnoreRules
 
     rules = IgnoreRules.load()
-    engines = []
-    for pair in pairs:
-        db = StateDB(pair.db_path)
-        if db.page_token is None:
-            plog = logging.getLogger("gdrivesync.pull")
-            plog.info("[%s] first run: downloading %s", pair.name, pair.remote_path)
-            db.close()
-            res = _pull_pair(client, settings, pair, log=plog.info, oplog=oplog)
-            if res.errors:
-                for path, msg in res.errors:
-                    plog.error("[%s] %s: %s", pair.name, path, msg)
-                raise PullError(
-                    f"Initial download of {pair.name!r} had {len(res.errors)} errors; re-run to retry."
-                )
-            db = StateDB(pair.db_path)
-        engines.append(
-            SyncEngine(
-                client, db, pair.root,
-                remote_root_id=pair.remote_id,
-                excluded=pair.excluded_folder_ids,
-                rules=rules,
-                name=pair.name,
-                oplog=oplog,
-            )
-        )
-    return engines
+    return [_build_engine(settings, p, client, oplog, rules) for p in pairs]
 
 
 def _dry_run_sync(args, settings, pairs) -> int:
@@ -302,17 +428,14 @@ def _dry_run_sync(args, settings, pairs) -> int:
     total, errors = 0, 0
     for pair in pairs:
         print(f"== {pair.name}: {pair.root} ⇄ Drive {pair.remote_path}  (dry run)")
-        db = StateDB(pair.db_path) if pair.db_path.exists() else None
-        if db is None or db.page_token is None:
-            if db:
-                db.close()
-            print("  never synced: this is what the first download would do")
+        snap = _dry_state(pair)
+        if snap.page_token is None:
+            snap.close()
+            print("  no sync state: this is what the first download / rebuild would do")
             res = _pull_pair(client, settings, pair, dry_run=True, log=lambda m: print("  " + m))
             _print_pull(res, dry_run=True)
             total += res.downloaded + len(res.conflicts)
             continue
-        snap = db.snapshot()
-        db.close()
         oplog = OpLog(dry_run=True, echo=lambda m: print("  " + m))
         engine = SyncEngine(
             client, snap, pair.root,
@@ -349,6 +472,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     if args.dry_run:
         logging.getLogger("gdrivesync.ops").setLevel(logging.WARNING)
         return _dry_run_sync(args, settings, pairs)
+    held = _locks(pairs)  # noqa: F841 — held until exit
     errors = 0
     for engine in _engines(settings, pairs, _client(), _oplog()):
         engine.settle_s = 0
@@ -371,11 +495,28 @@ def cmd_daemon(args: argparse.Namespace) -> int:
 
     _setup_logging(args.verbose)
     settings = config.Settings.load()
-    engines = _engines(settings, _selected_pairs(settings, None), _client(), _oplog())
+    pairs = _selected_pairs(settings, None)
+    held = _locks(pairs)  # noqa: F841 — held for the life of the service
+    client, oplog = _client(), _oplog()
+    engines = _engines(settings, pairs, client, oplog)
+
+    def rebuild(engine):
+        from gdrivesync.state import quarantine
+
+        pair = settings.pair(engine.name)
+        try:
+            engine.db.close()
+        except Exception:  # noqa: BLE001
+            pass
+        moved = quarantine(pair.db_path, "corrupt")
+        logging.getLogger("gdrivesync").error("[%s] corrupted state kept as %s", pair.name, moved)
+        return _build_engine(settings, pair, client, oplog)
+
     d = Daemon(
         engines,
         poll_interval_s=settings.poll_interval_s,
         full_check_s=settings.full_check_hours * 3600,
+        rebuild=rebuild,
     )
     d.install_signal_handlers()
     d.run()
@@ -390,10 +531,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     settings = config.Settings.load()
     found_any = False
     client = None
-    for pair in _selected_pairs(settings, None):
-        if not pair.db_path.exists():
-            continue
-        db = StateDB(pair.db_path)
+    pairs = [p for p in _selected_pairs(settings, None) if p.db_path.exists()]
+    held = _locks(pairs) if args.fix else []  # noqa: F841
+    for pair in pairs:
+        db = _open_state(pair) if args.fix else _dry_state(pair)
         try:
             pending = db.all_pending()
             if pending:
@@ -486,6 +627,9 @@ def cmd_config(args: argparse.Namespace) -> int:
     if args.max_transfers is not None:
         s.max_transfers = max(1, args.max_transfers)
         changed = True
+    if args.prefer_newer_on_rebuild is not None:
+        s.prefer_newer_on_rebuild = args.prefer_newer_on_rebuild == "on"
+        changed = True
     if args.full_check_hours is not None:
         s.full_check_hours = max(0.0, args.full_check_hours)
         changed = True
@@ -497,6 +641,7 @@ def cmd_config(args: argparse.Namespace) -> int:
     print(f"operation log  : {config.OPS_LOG}")
     print(f"poll interval  : {s.poll_interval_s}s")
     print(f"max transfers  : {s.max_transfers}")
+    print(f"rebuild: newer local wins : {'on' if s.prefer_newer_on_rebuild else 'off (conflicted copies)'}")
     print(f"full check     : " + (f"every {s.full_check_hours:g}h" if s.full_check_hours else "off"))
     print(f"synced folders : {len(s.pairs)} (see `gdrivesync pair list`)")
     if changed:
@@ -532,6 +677,16 @@ def build_parser() -> argparse.ArgumentParser:
     pm = prs.add_parser("remove", help="stop syncing a pair (files are left in place)")
     pm.add_argument("name")
     pm.set_defaults(func=cmd_pair_remove)
+    rb = prs.add_parser("rebuild", help="rebuild a pair's sync state by comparing with Drive")
+    rb.add_argument("name")
+    rb.add_argument("-n", "--dry-run", action="store_true", help="show what would happen")
+    newer = rb.add_mutually_exclusive_group()
+    newer.add_argument("--prefer-newer", dest="prefer_newer", action="store_true", default=None,
+                       help="upload local files newer than Drive as new versions "
+                            "instead of keeping conflicted copies")
+    newer.add_argument("--keep-both", dest="prefer_newer", action="store_false",
+                       help="always keep differing local files as conflicted copies")
+    rb.set_defaults(func=cmd_pair_rebuild)
 
     ex = sub.add_parser("exclude", help="stop/start syncing a subfolder (selective sync)")
     ex.add_argument("action", choices=["add", "remove", "list"])
@@ -573,6 +728,8 @@ def build_parser() -> argparse.ArgumentParser:
     cfg = sub.add_parser("config", help="show or change settings")
     cfg.add_argument("--poll-interval", type=int, help="seconds between Drive checks")
     cfg.add_argument("--max-transfers", type=int, help="parallel downloads during pull")
+    cfg.add_argument("--prefer-newer-on-rebuild", choices=["on", "off"],
+                     help="when rebuilding sync state, upload newer local files as new versions")
     cfg.add_argument("--full-check-hours", type=float,
                      help="how often the service compares everything with Drive (0 = never)")
     cfg.set_defaults(func=cmd_config)
@@ -588,8 +745,9 @@ def main(argv: list[str] | None = None) -> int:
         from gdrivesync.engine import SyncError
         from gdrivesync.pairs import PairError
         from gdrivesync.pull import PullError
+        from gdrivesync.state import PairBusy
 
-        if isinstance(e, (AuthError, PullError, SyncError, PairError)):
+        if isinstance(e, (AuthError, PullError, SyncError, PairError, PairBusy)):
             print(f"error: {e}", file=sys.stderr)
             return 1
         raise

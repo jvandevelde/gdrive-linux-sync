@@ -2,10 +2,84 @@
 
 from __future__ import annotations
 
+import fcntl
+import logging
+import os
 import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+log = logging.getLogger("gdrivesync.state")
+
+
+def is_corruption(e: BaseException) -> bool:
+    """True for SQLite errors that mean the DB file is damaged (not e.g. 'locked')."""
+    if not isinstance(e, sqlite3.DatabaseError):
+        return False
+    name = getattr(e, "sqlite_errorname", "")
+    if name in ("SQLITE_CORRUPT", "SQLITE_NOTADB"):
+        return True
+    msg = str(e).lower()
+    return "malformed" in msg or "not a database" in msg or "corrupt" in msg
+
+
+def quarantine(path: Path, label: str = "corrupt") -> Path | None:
+    """Move a DB (and its -wal/-shm files) aside, keeping it for inspection."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    target = path.with_name(f"{path.name}.{label}-{stamp}")
+    n = 2
+    while target.exists():
+        target = path.with_name(f"{path.name}.{label}-{stamp}-{n}")
+        n += 1
+    os.replace(path, target)
+    for suffix in ("-wal", "-shm"):
+        side = Path(str(path) + suffix)
+        if side.exists():
+            os.replace(side, Path(str(target) + suffix))
+    return target
+
+
+class PairBusy(RuntimeError):
+    pass
+
+
+class PairLock:
+    """Exclusive per-pair lock so the service and CLI commands that change
+    things never work on the same pair at once (released when the process ends)."""
+
+    def __init__(self, db_path: Path):
+        self.path = Path(str(db_path) + ".lock")
+        self._fh = None
+
+    def acquire(self) -> "PairLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(self.path, "a+")
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fh.close()
+            raise PairBusy(
+                "this folder is being synced by another gdrivesync process (the service?). "
+                "Stop it first: systemctl --user stop gdrivesync"
+            ) from None
+        self._fh = fh
+        return self
+
+    def release(self) -> None:
+        if self._fh:
+            fcntl.flock(self._fh, fcntl.LOCK_UN)
+            self._fh.close()
+            self._fh = None
+
+    def __enter__(self) -> "PairLock":
+        return self.acquire()
+
+    def __exit__(self, *exc) -> None:
+        self.release()
 
 SCHEMA_VERSION = 1
 
@@ -72,6 +146,32 @@ class StateDB:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
         self.set("schema_version", str(SCHEMA_VERSION))
+
+    @classmethod
+    def open_checked(cls, path: Path) -> tuple["StateDB", Path | None]:
+        """Open a DB, verifying its integrity first. A damaged file is moved aside
+        and a fresh, empty DB returned (which triggers a rebuild). Returns
+        (db, quarantined_path_or_None)."""
+        path = Path(path)
+        if path.exists():
+            try:
+                conn = sqlite3.connect(str(path))
+                try:
+                    result = conn.execute("PRAGMA quick_check").fetchone()
+                finally:
+                    conn.close()
+                ok = result is not None and result[0] == "ok"
+                problem = "" if ok else str(result and result[0])
+            except sqlite3.DatabaseError as e:
+                if not is_corruption(e):
+                    raise
+                ok, problem = False, str(e)
+            if not ok:
+                moved = quarantine(path, "corrupt")
+                log.error("State DB %s is damaged (%s); moved it to %s and starting a rebuild.",
+                          path, problem, moved)
+                return cls(path), moved
+        return cls(path), None
 
     def snapshot(self) -> "StateDB":
         """An in-memory copy (for dry runs: decisions proceed, nothing persists)."""

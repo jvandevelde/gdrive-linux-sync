@@ -16,12 +16,14 @@ def _xdg(var: str, default: str) -> Path:
 
 CONFIG_DIR = _xdg("XDG_CONFIG_HOME", ".config")
 DATA_DIR = _xdg("XDG_DATA_HOME", ".local/share")
+STATE_DIR = _xdg("XDG_STATE_HOME", ".local/state")
 
 CLIENT_SECRET_FILE = CONFIG_DIR / "client_secret.json"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 IGNORE_FILE = CONFIG_DIR / "ignore"
 TOKEN_FILE = DATA_DIR / "token.json"
 STATE_DB = DATA_DIR / "state.db"
+OPS_LOG = STATE_DIR / "operations.log"
 
 TMP_DIRNAME = ".gdrivesync-tmp"
 

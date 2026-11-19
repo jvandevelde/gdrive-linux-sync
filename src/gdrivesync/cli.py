@@ -12,6 +12,12 @@ from gdrivesync import __version__, config
 RESTART_HINT = "If the service is running: systemctl --user restart gdrivesync"
 
 
+def _oplog():
+    from gdrivesync.oplog import OpLog
+
+    return OpLog(config.OPS_LOG)
+
+
 def _client():
     from gdrivesync import auth
     from gdrivesync.drive import DriveClient
@@ -192,11 +198,11 @@ def _print_pull(res, dry_run: bool) -> None:
         print(f"  error {path}: {msg}", file=sys.stderr)
 
 
-def _pull_pair(client, settings, pair, *, dry_run=False, log=print):
+def _pull_pair(client, settings, pair, *, dry_run=False, log=print, oplog=None):
     from gdrivesync.pull import pull
     from gdrivesync.state import StateDB
 
-    db = StateDB(pair.db_path)
+    db = StateDB(":memory:") if dry_run and not pair.db_path.exists() else StateDB(pair.db_path)
     try:
         return pull(
             client, db, pair.root,
@@ -205,6 +211,8 @@ def _pull_pair(client, settings, pair, *, dry_run=False, log=print):
             max_workers=settings.max_transfers,
             dry_run=dry_run,
             log=log,
+            oplog=oplog,
+            pair=pair.name,
         )
     finally:
         db.close()
@@ -220,6 +228,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
             client, settings, pair,
             dry_run=args.dry_run,
             log=(lambda _m: None) if args.quiet else print,
+            oplog=None if args.dry_run else _oplog(),
         )
         _print_pull(res, args.dry_run)
         failed |= bool(res.errors)
@@ -228,7 +237,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
     return 2 if failed else 0
 
 
-def _engines(settings, pairs, client):
+def _engines(settings, pairs, client, oplog=None):
     """One SyncEngine per pair, running the initial download for new pairs."""
     from gdrivesync.engine import SyncEngine
     from gdrivesync.localfs import IgnoreRules
@@ -243,7 +252,7 @@ def _engines(settings, pairs, client):
             plog = logging.getLogger("gdrivesync.pull")
             plog.info("[%s] first run: downloading %s", pair.name, pair.remote_path)
             db.close()
-            res = _pull_pair(client, settings, pair, log=plog.info)
+            res = _pull_pair(client, settings, pair, log=plog.info, oplog=oplog)
             if res.errors:
                 for path, msg in res.errors:
                     plog.error("[%s] %s: %s", pair.name, path, msg)
@@ -258,9 +267,59 @@ def _engines(settings, pairs, client):
                 excluded=pair.excluded_folder_ids,
                 rules=rules,
                 name=pair.name,
+                oplog=oplog,
             )
         )
     return engines
+
+
+def _dry_run_sync(args, settings, pairs) -> int:
+    """Run the real sync logic against a throwaway copy of each pair's state:
+    Drive is only read, the local disk isn't touched."""
+    from gdrivesync.engine import SyncEngine
+    from gdrivesync.localfs import IgnoreRules
+    from gdrivesync.oplog import OpLog
+    from gdrivesync.state import StateDB
+
+    client = _client()
+    total, errors = 0, 0
+    for pair in pairs:
+        print(f"== {pair.name}: {pair.root} ⇄ Drive {pair.remote_path}  (dry run)")
+        db = StateDB(pair.db_path) if pair.db_path.exists() else None
+        if db is None or db.page_token is None:
+            if db:
+                db.close()
+            print("  never synced: this is what the first download would do")
+            res = _pull_pair(client, settings, pair, dry_run=True, log=lambda m: print("  " + m))
+            _print_pull(res, dry_run=True)
+            total += res.downloaded + len(res.conflicts)
+            continue
+        snap = db.snapshot()
+        db.close()
+        oplog = OpLog(dry_run=True, echo=lambda m: print("  " + m))
+        engine = SyncEngine(
+            client, snap, pair.root,
+            remote_root_id=pair.remote_id,
+            excluded=pair.excluded_folder_ids,
+            rules=IgnoreRules.load(),
+            settle_s=0,
+            name="",
+            oplog=oplog,
+            dry_run=True,
+        )
+        engine.allow_mass_delete = args.allow_mass_delete
+        stats = [engine.remote_pass(), engine.local_pass()]
+        if engine.dirty:
+            stats.append(engine.local_pass())
+        for st in stats:
+            for path, msg in st.errors:
+                print(f"  error {path}: {msg}", file=sys.stderr)
+                errors += 1
+        if oplog.count == 0:
+            print("  nothing to do")
+        total += oplog.count
+    print(f"\n{total} operation(s) would be performed. Nothing was changed.")
+    return 2 if errors else 0
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
@@ -269,8 +328,11 @@ def cmd_sync(args: argparse.Namespace) -> int:
     _setup_logging(args.verbose)
     settings = config.Settings.load()
     pairs = _selected_pairs(settings, args.pair)
+    if args.dry_run:
+        logging.getLogger("gdrivesync.ops").setLevel(logging.WARNING)
+        return _dry_run_sync(args, settings, pairs)
     errors = 0
-    for engine in _engines(settings, pairs, _client()):
+    for engine in _engines(settings, pairs, _client(), _oplog()):
         engine.settle_s = 0
         engine.allow_mass_delete = args.allow_mass_delete
         remote = engine.remote_pass()
@@ -291,7 +353,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
 
     _setup_logging(args.verbose)
     settings = config.Settings.load()
-    engines = _engines(settings, _selected_pairs(settings, None), _client())
+    engines = _engines(settings, _selected_pairs(settings, None), _client(), _oplog())
     d = Daemon(engines, poll_interval_s=settings.poll_interval_s)
     d.install_signal_handlers()
     d.run()
@@ -328,7 +390,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                     print(f"  {it.rel_path}  (same as {g.keep.rel_path})")
             if args.fix:
                 client = client or _client()
-                removed = fix_duplicates(client, db, pair.root, groups)
+                removed = fix_duplicates(client, db, pair.root, groups, _oplog(), pair.name)
                 print(f"  moved {removed} duplicate(s) to the trash.")
         finally:
             db.close()
@@ -339,6 +401,57 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print("\nRun `gdrivesync doctor --fix` to move the duplicates to the trash "
               "(on Drive and locally). Stop the service first.")
         return 1
+    return 0
+
+
+def cmd_log(args: argparse.Namespace) -> int:
+    import json
+    import time
+    from collections import deque
+    from datetime import datetime
+
+    from gdrivesync.oplog import describe, read_entries
+
+    path = config.OPS_LOG
+
+    def show(e: dict) -> None:
+        if args.pair and e.get("pair") != args.pair:
+            return
+        if args.json:
+            print(json.dumps(e, ensure_ascii=False))
+            return
+        try:
+            ts = datetime.fromisoformat(e["ts"]).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        except (KeyError, ValueError):
+            ts = e.get("ts", "?")
+        print(f"{ts}  {describe(e)}")
+
+    entries = [e for e in read_entries(path) if not args.pair or e.get("pair") == args.pair]
+    for e in deque(entries, maxlen=args.n) if args.n else entries:
+        show(e)
+    if not entries and not args.follow:
+        print(f"No operations logged yet ({path}).")
+    if args.follow:
+        pos = path.stat().st_size if path.exists() else 0
+        try:
+            while True:
+                time.sleep(1)
+                if not path.exists():
+                    continue
+                size = path.stat().st_size
+                if size < pos:  # rotated
+                    pos = 0
+                if size > pos:
+                    with open(path, encoding="utf-8") as fh:
+                        fh.seek(pos)
+                        for line in fh:
+                            try:
+                                show(json.loads(line))
+                            except ValueError:
+                                pass
+                        pos = fh.tell()
+        except KeyboardInterrupt:
+            pass
     return 0
 
 
@@ -356,6 +469,7 @@ def cmd_config(args: argparse.Namespace) -> int:
     print(f"config dir     : {config.CONFIG_DIR}")
     print(f"data dir       : {config.DATA_DIR}")
     print(f"ignore file    : {config.IGNORE_FILE}")
+    print(f"operation log  : {config.OPS_LOG}")
     print(f"poll interval  : {s.poll_interval_s}s")
     print(f"max transfers  : {s.max_transfers}")
     print(f"synced folders : {len(s.pairs)} (see `gdrivesync pair list`)")
@@ -407,9 +521,18 @@ def build_parser() -> argparse.ArgumentParser:
     sy = sub.add_parser("sync", help="run one two-way sync pass and exit")
     sy.add_argument("--pair", help="only this pair")
     sy.add_argument("-v", "--verbose", action="store_true")
+    sy.add_argument("-n", "--dry-run", action="store_true",
+                    help="show every change that would be made, without making any")
     sy.add_argument("--allow-mass-delete", action="store_true",
                     help="allow trashing many files on Drive that disappeared locally")
     sy.set_defaults(func=cmd_sync)
+
+    lg = sub.add_parser("log", help="show the log of operations performed")
+    lg.add_argument("-n", type=int, default=50, help="how many recent entries (0 = all)")
+    lg.add_argument("-f", "--follow", action="store_true", help="keep printing new entries")
+    lg.add_argument("--pair", help="only this pair")
+    lg.add_argument("--json", action="store_true", help="raw JSON lines")
+    lg.set_defaults(func=cmd_log)
 
     dm = sub.add_parser("daemon", help="run the background sync service")
     dm.add_argument("-v", "--verbose", action="store_true")

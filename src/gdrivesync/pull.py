@@ -170,7 +170,13 @@ def pull(
     max_workers: int = 4,
     dry_run: bool = False,
     log: Callable[[str], None] = print,
+    oplog=None,
+    pair: str = "",
 ) -> PullResult:
+    def rec(op: str, path: str, **detail) -> None:
+        if oplog is not None and not dry_run:
+            oplog.record(op, path, pair=pair, **detail)
+
     root = root.expanduser().resolve()
     recorded_root = db.get("sync_root")
     if recorded_root and recorded_root != str(root):
@@ -222,16 +228,20 @@ def pull(
                 if dest.exists() and not dest.is_dir():
                     raise PullError("a file is in the way of this folder")
                 if not dry_run:
-                    dest.mkdir(exist_ok=True)
+                    if not dest.is_dir():
+                        dest.mkdir()
+                        rec("mkdir", rel)
                     db.upsert(make_item(f, rel, None))
                 res.folders += 1
             elif is_google_doc(mime):
+                if not dry_run and not dest.exists():
+                    rec("write_link", rel, file_id=f["id"])
                 _write_stub(f, dest, rel, db, dry_run)
                 res.stubs += 1
             else:
                 if f.get("capabilities", {}).get("canDownload") is False:
                     raise PullError("Drive does not allow downloading this file")
-                job = _plan_file(f, rel, dest, root, db, res, dry_run, log)
+                job = _plan_file(f, rel, dest, root, db, res, dry_run, log, rec)
                 if job:
                     downloads.append(job)
         except (OSError, PullError) as e:
@@ -257,7 +267,7 @@ def pull(
 
     if downloads:
         log(f"Downloading {len(downloads)} files ({need / 1e6:.1f} MB)…")
-        _run_downloads(client, db, root, tmp, downloads, res, max_workers, log)
+        _run_downloads(client, db, root, tmp, downloads, res, max_workers, log, rec)
 
     # Forget DB rows for items that no longer exist remotely (local files are left alone).
     for item in db.all():
@@ -337,6 +347,7 @@ def _plan_file(
     res: PullResult,
     dry_run: bool,
     log: Callable[[str], None],
+    rec: Callable[..., None] = lambda *a, **k: None,
 ) -> _Download | None:
     """Decide what to do for a binary file. Returns a download job or None."""
     prev = db.by_id(f["id"])
@@ -364,6 +375,7 @@ def _plan_file(
         log(f"conflict: {rel} -> {backup.name}")
         if not dry_run:
             dest.rename(backup)
+            rec("conflict", str(backup.relative_to(root)), src=rel)
         res.conflicts.append(str(backup.relative_to(root)))
         return _Download(f, rel)
 
@@ -374,6 +386,7 @@ def _plan_file(
             log(f"move: {prev.rel_path} -> {rel}")
             if not dry_run:
                 old.rename(dest)
+                rec("move_local", rel, src=prev.rel_path, reason="moved on Drive")
                 db.upsert(make_item(f, rel, dest.stat()))
             res.moved += 1
             return None
@@ -390,6 +403,7 @@ def _run_downloads(
     res: PullResult,
     max_workers: int,
     log: Callable[[str], None],
+    rec: Callable[..., None] = lambda *a, **k: None,
 ) -> None:
     def work(job: _Download) -> os.stat_result:
         return download_file(client, job.file, root / job.rel, tmp)
@@ -407,6 +421,8 @@ def _run_downloads(
                 log(f"[{n}/{total}] FAILED {job.rel}: {e}")
                 continue
             db.upsert(make_item(job.file, job.rel, st))  # DB writes stay on this thread
+            rec("download", job.rel, file_id=job.file["id"], size=st.st_size,
+                md5=job.file.get("md5Checksum"))
             res.downloaded += 1
             res.downloaded_bytes += st.st_size
             log(f"[{n}/{total}] {job.rel}")

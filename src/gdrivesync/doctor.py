@@ -59,17 +59,26 @@ def find_duplicates(db: StateDB) -> list[DuplicateGroup]:
     return sorted(groups, key=lambda g: g.keep.rel_path)
 
 
-def fix_duplicates(client, db: StateDB, root: Path, groups: list[DuplicateGroup]) -> int:
+def fix_duplicates(
+    client, db: StateDB, root: Path, groups: list[DuplicateGroup], oplog=None, pair: str = ""
+) -> int:
     """Trash the extras on Drive and locally. Returns how many were removed."""
+
+    def rec(op, path, **kw):
+        if oplog is not None:
+            oplog.record(op, path, pair=pair, **kw)
+
     removed = 0
     for g in groups:
         for it in g.extras:
             client.trash(it.file_id)
+            rec("trash_remote", it.rel_path, file_id=it.file_id, reason="duplicate")
             p = root / it.rel_path
-            if p.is_dir() and not any(p.iterdir()):
+            if (p.is_dir() and not any(p.iterdir())) or (
+                p.is_file() and unchanged_since(it, p.stat())
+            ):
                 trash_local(p)
-            elif p.is_file() and unchanged_since(it, p.stat()):
-                trash_local(p)
+                rec("trash_local", it.rel_path, reason="duplicate")
             else:
                 log.warning("left local %s in place (changed since sync)", it.rel_path)
             db.delete(it.file_id)

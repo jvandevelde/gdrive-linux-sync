@@ -206,6 +206,22 @@ that pair stops with an error instead of mirroring the deletion locally.
 - **Re-included:** the folder is fetched and downloaded with its contents.
 - Remote changes inside excluded folders are ignored.
 
+### Operation log and dry run
+
+All mutations in `SyncEngine` go through a small set of `_fx_*` methods
+(download, write_link, mkdir, move_local/conflict, trash_local, delete_local,
+create_folder, upload, update, move_remote, trash_remote). Each records an entry
+via `OpLog` *after* it succeeds: JSON lines in `$XDG_STATE_HOME/gdrivesync/
+operations.log` plus the `gdrivesync.ops` logger. `pull` and `doctor --fix`
+record the same way.
+
+Dry run = the same engine with `dry_run=True` on `StateDB.snapshot()` (in-memory
+copy). The `_fx_*` methods log "would …" and return synthetic results instead of
+acting. To keep later decisions in the same run consistent, the engine keeps a
+virtual overlay of simulated local changes (moves, removals, created files) that
+`_abs()` and the local scan apply. A test runs a mixed two-way scenario both ways
+and asserts the dry run predicted exactly the operations the real run performed.
+
 ### Idempotent creates (no duplicates after crashes/retries)
 
 Drive's `files.create` isn't idempotent, so a crash or a retried request after

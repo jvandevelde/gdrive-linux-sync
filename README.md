@@ -66,6 +66,34 @@ Everything lives in `~/.config/gdrivesync/settings.json`; restart the service af
 changes (`systemctl --user restart gdrivesync`). Older single-folder configs are
 migrated automatically to a pair called "My Drive".
 
+## Dry run and operation log
+
+```sh
+gdrivesync sync --dry-run           # every change it *would* make, both directions; changes nothing
+gdrivesync sync --dry-run --pair Work
+gdrivesync pull --dry-run           # same, for the initial download only
+gdrivesync log                      # last 50 operations actually performed
+gdrivesync log -f                   # follow live (like tail -f)
+gdrivesync log -n 0 --pair Work     # everything for one pair
+gdrivesync log --json | jq .        # raw records
+```
+
+The dry run uses the real sync logic on a throwaway copy of the sync state: Drive is
+only read and your local files aren't touched. Example output:
+
+```
+== My Drive: /home/you/Google Drive ⇄ Drive /  (dry run)
+  would download Docs/report.pdf (1.2 MB)
+  would move local Old -> Renamed — moved on Drive
+  would upload new file Notes/todo.txt (312 B)
+  would trash on Drive old-draft.txt — deleted locally
+4 operation(s) would be performed. Nothing was changed.
+```
+
+Every change made by `pull`, `sync`, `doctor --fix` or the service is appended as a JSON
+line to `~/.local/state/gdrivesync/operations.log` (rotated at 10 MB, 5 old files kept)
+and also appears in the service's journal.
+
 ## How two-way sync behaves
 
 | You do | Result |

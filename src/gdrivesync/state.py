@@ -73,6 +73,12 @@ class StateDB:
         self.conn.executescript(SCHEMA)
         self.set("schema_version", str(SCHEMA_VERSION))
 
+    def snapshot(self) -> "StateDB":
+        """An in-memory copy (for dry runs: decisions proceed, nothing persists)."""
+        copy = StateDB(":memory:")
+        self.conn.backup(copy.conn)
+        return copy
+
     def close(self) -> None:
         self.conn.close()
 

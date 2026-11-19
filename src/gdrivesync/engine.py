@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 import os
 import posixpath
 import shutil
+import stat as statmod
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -29,6 +31,7 @@ from pathlib import Path
 from gdrivesync.config import BUILTIN_IGNORES, TMP_DIRNAME
 from gdrivesync.drive import FOLDER_MIME, SHORTCUT_MIME, is_google_doc
 from gdrivesync.localfs import IgnoreRules, is_dir_stat, scan, trash_local
+from gdrivesync.oplog import OpLog
 from gdrivesync.names import DEFAULT_STUB_EXT, DOC_STUB_EXT, dedupe, stub_name, to_local, to_remote
 from gdrivesync.pull import (
     PullError,
@@ -37,6 +40,7 @@ from gdrivesync.pull import (
     make_item,
     md5_file,
     read_stub_id,
+    rfc3339_to_ts,
     unchanged_since,
     write_stub,
 )
@@ -51,6 +55,19 @@ EXCLUDED_KEY = "excluded_paths"  # {folder_id: local rel path it would occupy}
 
 class SyncError(RuntimeError):
     pass
+
+
+@dataclass
+class FakeStat:
+    """Stand-in for os.stat_result in dry runs (only the fields we read)."""
+
+    st_size: int = 0
+    st_mtime_ns: int = 0
+    st_mode: int = statmod.S_IFREG | 0o644
+
+    @property
+    def st_mtime(self) -> float:
+        return self.st_mtime_ns / 1e9
 
 
 @dataclass
@@ -86,8 +103,20 @@ class SyncEngine:
         settle_s: float = 3.0,
         mass_delete_limit: int = 100,
         name: str = "",
+        oplog: OpLog | None = None,
+        dry_run: bool = False,
     ):
+        """With dry_run=True, pass a StateDB.snapshot(): Drive is only read, the
+        local disk isn't touched, and every change is reported via ``oplog``."""
         self.name = name
+        self.dry_run = dry_run
+        self.oplog = oplog or OpLog(dry_run=dry_run)
+        # Dry-run overlay of simulated local changes, so later decisions in the
+        # same run see them: (new_rel, old_rel) moves, removed and created paths.
+        self._vmoves: list[tuple[str, str]] = []
+        self._vgone: set[str] = set()
+        self._vcreated: set[str] = set()
+        self._dry_ids = 0
         self.client = client
         self.db = db
         self.root = Path(root).expanduser().resolve()
@@ -117,7 +146,152 @@ class SyncEngine:
     # ================================================================ helpers
 
     def _abs(self, rel: str) -> Path:
+        """Where rel lives on disk (in dry runs, before simulated moves)."""
+        for new, old in reversed(self._vmoves):
+            if rel == new or rel.startswith(new + "/"):
+                rel = old + rel[len(new):]
         return self.root / rel
+
+    # ================================================================ effects
+    # Every change to the local disk or to Drive goes through one of these, so
+    # it lands in the operation log — and is only simulated in dry-run mode.
+
+    def _op(self, op: str, path: str, **detail) -> None:
+        self.oplog.record(op, path, pair=self.name, **detail)
+
+    def _fx_download(self, f: dict, rel: str):
+        size = int(f.get("size", 0))
+        self._stats.downloaded += 1
+        if self.dry_run:
+            self._op("download", rel, file_id=f["id"], size=size)
+            self._vgone.discard(rel)
+            self._vcreated.add(rel)
+            ts = rfc3339_to_ts(f["modifiedTime"]) if f.get("modifiedTime") else 0
+            return FakeStat(size, int(ts * 1e9))
+        st = download_file(self.client, f, self.root / rel, self.tmp)
+        self._op("download", rel, file_id=f["id"], size=st.st_size, md5=f.get("md5Checksum"))
+        return st
+
+    def _fx_write_link(self, f: dict, rel: str):
+        dest = self._abs(rel)
+        if self.dry_run:
+            if read_stub_id(dest) != f["id"]:
+                self._op("write_link", rel, file_id=f["id"])
+            self._vcreated.add(rel)
+            return FakeStat(0, 0)
+        new = not dest.exists()
+        st = write_stub(f, dest)
+        if new:
+            self._op("write_link", rel, file_id=f["id"])
+        return st
+
+    def _fx_mkdir(self, rel: str) -> None:
+        p = self._abs(rel)
+        if p.is_dir() and rel not in self._vgone:
+            return
+        if self.dry_run:
+            self._vgone.discard(rel)
+            self._vcreated.add(rel)
+        else:
+            p.mkdir(exist_ok=True)
+        self._op("mkdir", rel)
+
+    def _fx_move_local(self, src: str, dst: str, *, op: str = "move_local", reason: str | None = None):
+        if self.dry_run:
+            self._vmoves.append((dst, src))
+        else:
+            (self.root / src).rename(self.root / dst)
+        self._op(op, dst, src=src, reason=reason)
+
+    def _fx_trash_local(self, rel: str, reason: str) -> None:
+        if self.dry_run:
+            self._vgone.add(rel)
+        else:
+            trash_local(self.root / rel)
+        self._op("trash_local", rel, reason=reason)
+
+    def _fx_delete_local(self, rel: str, reason: str) -> None:
+        if self.dry_run:
+            self._vgone.add(rel)
+        else:
+            shutil.rmtree(self.root / rel)
+        self._op("delete_local", rel, reason=reason)
+
+    def _new_id(self) -> str:
+        if self.dry_run:
+            self._dry_ids += 1
+            return f"dry-run-{self._dry_ids}"
+        return self.client.generate_id()
+
+    def _fx_create_folder(self, rel: str, name: str, parent_id: str, file_id: str) -> dict:
+        if self.dry_run:
+            f = {"id": file_id, "name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]}
+        else:
+            f = self.client.create_folder(name, parent_id, file_id=file_id)
+        self._op("create_folder", rel, file_id=f["id"])
+        return f
+
+    def _fx_upload_new(self, rel, path, name, parent_id, mtime, file_id) -> dict:
+        if self.dry_run:
+            size = path.stat().st_size
+            self._op("upload", rel, file_id=file_id, size=size)
+            return {
+                "id": file_id, "name": name, "parents": [parent_id],
+                "mimeType": mimetypes.guess_type(name)[0] or "application/octet-stream",
+                "md5Checksum": md5_file(path), "size": str(size),
+            }
+        f = self.client.upload_new(path, name, parent_id, mtime=mtime, file_id=file_id)
+        self._op("upload", rel, file_id=f["id"], size=int(f.get("size", 0)), md5=f.get("md5Checksum"))
+        return f
+
+    def _fx_update_content(self, rel, file_id, path, mtime) -> dict:
+        if self.dry_run:
+            size = path.stat().st_size
+            self._op("update", rel, file_id=file_id, size=size)
+            f = dict(self.client.get_file(file_id) or {"id": file_id, "name": path.name,
+                                                      "mimeType": "application/octet-stream"})
+            f.update(md5Checksum=md5_file(path), size=str(size))
+            return f
+        f = self.client.update_content(file_id, path, mtime=mtime)
+        self._op("update", rel, file_id=file_id, size=int(f.get("size", 0)), md5=f.get("md5Checksum"))
+        return f
+
+    def _fx_move_remote(self, src: str, dst: str, file_id: str, **kw) -> dict | None:
+        if self.dry_run:
+            f = self.client.get_file(file_id)
+            if f is not None:
+                f = dict(f)
+                if kw.get("name"):
+                    f["name"] = kw["name"]
+                if kw.get("add_parent"):
+                    f["parents"] = [kw["add_parent"]]
+        else:
+            f = self.client.update_metadata(file_id, **kw)
+        self._op("move_remote", dst, src=src, file_id=file_id)
+        return f
+
+    def _fx_trash_remote(self, rel: str, file_id: str, reason: str) -> None:
+        if not self.dry_run:
+            self.client.trash(file_id)
+        self._op("trash_remote", rel, file_id=file_id, reason=reason)
+
+    def _virtualize(self, found: dict) -> dict:
+        """Dry runs: make a fresh scan reflect the simulated local changes."""
+        out = {}
+        for rel, st in found.items():
+            for new, old in self._vmoves:
+                if rel == old or rel.startswith(old + "/"):
+                    rel = new + rel[len(old):]
+            if rel in self._vgone or any(rel.startswith(g + "/") for g in self._vgone):
+                continue
+            out[rel] = st
+        for rel in self._vcreated:  # simulated downloads replace what's on disk
+            if rel not in self._vgone:
+                it = self.db.by_path(rel)
+                if it is not None:
+                    mode = statmod.S_IFDIR | 0o755 if it.is_folder else statmod.S_IFREG | 0o644
+                    out[rel] = FakeStat(it.local_size or 0, it.local_mtime_ns or 0, mode)
+        return out
 
     @staticmethod
     def _join(parent_rel: str, name: str) -> str:
@@ -161,20 +335,14 @@ class SyncEngine:
 
     def _set_aside(self, rel: str) -> str:
         """Rename an untracked/conflicting local path out of the way."""
-        src = self._abs(rel)
-        backup = conflict_name(src)
-        src.rename(backup)
-        backup_rel = str(backup.relative_to(self.root))
-        log.warning("conflict: kept local %s as %s", rel, backup_rel)
+        backup_rel = str(conflict_name(self.root / rel).relative_to(self.root))
+        self._fx_move_local(rel, backup_rel, op="conflict")
         self._stats.conflicts.append(backup_rel)
         self.dirty = True
         return backup_rel
 
-    def _download(self, f: dict, rel: str) -> os.stat_result:
-        st = download_file(self.client, f, self._abs(rel), self.tmp)
-        self._stats.downloaded += 1
-        log.info("downloaded %s", rel)
-        return st
+    def _download(self, f: dict, rel: str):
+        return self._fx_download(f, rel)
 
     def _fail(self, rel: str, e: Exception) -> None:
         msg = f"{type(e).__name__}: {e}"
@@ -297,9 +465,10 @@ class SyncEngine:
                 leftovers = [
                     e for e in os.listdir(p)
                     if not self.rules.ignored(self._join(item.rel_path, e))
+                    and self._join(item.rel_path, e) not in self._vgone
                 ]
                 if not leftovers:
-                    trash_local(p)
+                    self._fx_trash_local(item.rel_path, "deleted on Drive")
                     self._stats.trashed_local += 1
                 else:
                     # Holds locally-changed or new files: keep; they'll be re-uploaded.
@@ -309,9 +478,8 @@ class SyncEngine:
             return
         if p.is_file() and not p.is_symlink():
             if is_google_doc(item.mime_type) or unchanged_since(item, p.stat()):
-                trash_local(p)
+                self._fx_trash_local(item.rel_path, "deleted on Drive")
                 self._stats.trashed_local += 1
-                log.info("removed %s (deleted on Drive)", item.rel_path)
             else:
                 log.warning("kept %s (deleted on Drive, but edited locally) — re-uploading", item.rel_path)
                 self.dirty = True
@@ -326,7 +494,7 @@ class SyncEngine:
         if mime == FOLDER_MIME:
             if dest.exists() and not dest.is_dir():
                 self._set_aside(rel)
-            dest.mkdir(exist_ok=True)
+            self._fx_mkdir(rel)
             self.db.upsert(make_item(f, rel, None))
             # Contents may predate this change (moved in / restored from trash).
             for child in self.client.list_children(f["id"]):
@@ -337,7 +505,7 @@ class SyncEngine:
         if is_google_doc(mime):
             if dest.exists() and (dest.is_dir() or read_stub_id(dest) != f["id"]):
                 self._set_aside(rel)
-            self.db.upsert(make_item(f, rel, write_stub(f, dest)))
+            self.db.upsert(make_item(f, rel, self._fx_write_link(f, rel)))
             return
 
         if dest.exists():
@@ -360,21 +528,20 @@ class SyncEngine:
             if dst.exists():
                 self._set_aside(rel)
             if src.exists():
-                src.rename(dst)
+                self._fx_move_local(item.rel_path, rel, reason="moved on Drive")
             if item.is_folder:
                 self.db.move_prefix(item.rel_path, rel)
-            log.info("moved %s -> %s (on Drive)", item.rel_path, rel)
             self._stats.moved += 1
             item.rel_path = rel
 
         dest = self._abs(rel)
         if item.is_folder:
-            dest.mkdir(exist_ok=True)
+            self._fx_mkdir(rel)
             self.db.upsert(make_item(f, rel, None))
             return
 
         if is_google_doc(item.mime_type):
-            self.db.upsert(make_item(f, rel, write_stub(f, dest)))
+            self.db.upsert(make_item(f, rel, self._fx_write_link(f, rel)))
             return
 
         remote_md5 = f.get("md5Checksum")
@@ -436,7 +603,6 @@ class SyncEngine:
             changed = True
             f = self.client.get_file(fid)
             if f is not None:
-                log.info("re-including %s", f.get("name", fid))
                 self._apply_remote_one(fid, f)  # downloads the folder and its contents
         if changed:
             self._save_excluded_paths(paths)
@@ -461,11 +627,10 @@ class SyncEngine:
                 )
                 return False
         if base.exists():
-            shutil.rmtree(base)
+            self._fx_delete_local(item.rel_path, "excluded from sync; still on Drive")
         for it in tracked.values():
             self.db.delete(it.file_id)
         self.db.delete(item.file_id)
-        log.info("excluded %s: removed local copy (still on Drive)", item.rel_path)
         return True
 
     # ================================================================ local → remote
@@ -478,6 +643,8 @@ class SyncEngine:
         now = time.time()
         found = scan(self.root, self.rules)
         # Never upload into an excluded folder's place.
+        if self.dry_run:
+            found = self._virtualize(found)
         for ex in self._excluded_paths().values():
             for rel in [r for r in found if r == ex or r.startswith(ex + "/")]:
                 del found[rel]
@@ -614,7 +781,7 @@ class SyncEngine:
             raise SyncError("destination folder isn't synced yet")
         other = self.db.by_path(new_rel)
         if other and other.file_id != item.file_id:  # moved over an existing file
-            self.client.trash(other.file_id)
+            self._fx_trash_remote(new_rel, other.file_id, "replaced by a moved file")
             self.db.delete(other.file_id)
             self._stats.trashed_remote += 1
 
@@ -626,7 +793,10 @@ class SyncEngine:
             kw["add_parent"] = parent_id
             if item.parent_id:
                 kw["remove_parent"] = item.parent_id
-        f = self.client.update_metadata(item.file_id, **kw) if kw else self.client.get_file(item.file_id)
+        f = (
+            self._fx_move_remote(item.rel_path, new_rel, item.file_id, **kw)
+            if kw else self.client.get_file(item.file_id)
+        )
         if f is None:
             raise SyncError("file vanished on Drive")
 
@@ -636,17 +806,15 @@ class SyncEngine:
         # Keep the old content base so an edit + rename still uploads.
         new.md5, new.local_mtime_ns, new.local_size = item.md5, item.local_mtime_ns, item.local_size
         self.db.upsert(new)
-        log.info("moved %s -> %s (on Drive)", item.rel_path, new_rel)
         self._stats.moved += 1
 
     def _local_deleted(self, item: Item) -> None:
         if item.is_folder:
-            self.client.trash(item.file_id)
+            self._fx_trash_remote(item.rel_path, item.file_id, "deleted locally")
             for d in self.db.descendants(item.rel_path):
                 self.db.delete(d.file_id)
             self.db.delete(item.file_id)
             self._stats.trashed_remote += 1
-            log.info("trashed folder %s on Drive", item.rel_path)
             return
         if not is_google_doc(item.mime_type):
             f = self.client.get_file(item.file_id)
@@ -655,10 +823,9 @@ class SyncEngine:
                 if self._abs(item.rel_path).parent.is_dir():
                     self.db.upsert(make_item(f, item.rel_path, self._download(f, item.rel_path)))
                     return
-        self.client.trash(item.file_id)
+        self._fx_trash_remote(item.rel_path, item.file_id, "deleted locally")
         self.db.delete(item.file_id)
         self._stats.trashed_remote += 1
-        log.info("trashed %s on Drive", item.rel_path)
 
     def _local_new_folder(self, rel: str) -> None:
         parent_id = self._parent_id(rel)
@@ -673,12 +840,11 @@ class SyncEngine:
             f = existing[0]
         else:
             f = self._create_with_intent(
-                rel, parent_id, lambda fid: self.client.create_folder(name, parent_id, file_id=fid)
+                rel, parent_id, lambda fid: self._fx_create_folder(rel, name, parent_id, fid)
             )
         self.db.upsert(make_item(f, rel, None))
         self.db.remove_pending(rel)
         self._stats.folders_created += 1
-        log.info("created folder %s on Drive", rel)
 
     def _create_with_intent(self, rel: str, parent_id: str, create) -> dict:
         """Create on Drive under a pre-generated id journaled in the DB first, so a
@@ -692,7 +858,7 @@ class SyncEngine:
             log.info("resuming interrupted create of %s", rel)
             file_id = intent["file_id"]
         else:
-            file_id = self.client.generate_id()
+            file_id = self._new_id()
             self.db.add_pending(rel, file_id, parent_id)
         return create(file_id)
 
@@ -700,8 +866,7 @@ class SyncEngine:
         """Trash whatever an interrupted create left on Drive (if anything)."""
         f = self.client.get_file(intent["file_id"])
         if f is not None and not f.get("trashed") and self.db.by_id(f["id"]) is None:
-            self.client.trash(f["id"])
-            log.warning("trashed orphaned partial upload of %s on Drive", intent["rel_path"])
+            self._fx_trash_remote(intent["rel_path"], f["id"], "orphaned partial upload")
             self._stats.trashed_remote += 1
         self.db.remove_pending(intent["rel_path"])
 
@@ -738,16 +903,13 @@ class SyncEngine:
             f = self._create_with_intent(
                 rel,
                 parent_id,
-                lambda fid: self.client.upload_new(
-                    path, name, parent_id, mtime=st.st_mtime, file_id=fid
-                ),
+                lambda fid: self._fx_upload_new(rel, path, name, parent_id, st.st_mtime, fid),
             )
             if f.get("md5Checksum") != local_md5:
                 # Recovered an earlier, interrupted create whose content is now
                 # stale (the file changed since): bring it up to date.
-                f = self.client.update_content(f["id"], path, mtime=st.st_mtime)
+                f = self._fx_update_content(rel, f["id"], path, st.st_mtime)
             self._stats.uploaded += 1
-            log.info("uploaded %s", rel)
         # Base stat is from *before* the upload: if the file changed meanwhile,
         # the next pass sees the difference and uploads again.
         self.db.upsert(make_item(f, rel, st))
@@ -777,7 +939,6 @@ class SyncEngine:
             self._set_aside(item.rel_path)
             self.db.upsert(make_item(f, item.rel_path, self._download(f, item.rel_path)))
             return
-        f = self.client.update_content(item.file_id, path, mtime=st.st_mtime)
+        f = self._fx_update_content(item.rel_path, item.file_id, path, st.st_mtime)
         self.db.upsert(make_item(f, item.rel_path, st))
         self._stats.uploaded += 1
-        log.info("uploaded %s", item.rel_path)

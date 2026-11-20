@@ -20,22 +20,43 @@ restricted-scope verification for the full `drive` scope.
 
 ## Architecture
 
+```mermaid
+flowchart TB
+    subgraph desktop["Desktop integration (milestones 3–4, planned)"]
+        naut["Nautilus extension<br/><i>nautilus-python</i>"]
+        tray["Tray + settings<br/><i>GTK4 / libadwaita</i>"]
+    end
+
+    cli["gdrivesync CLI<br/><i>pair · sync · pull · log · doctor</i>"]
+
+    subgraph svc["gdrivesync daemon (systemd --user)"]
+        watch["File watcher<br/><i>watchdog / inotify</i>"]
+        poll["Change-feed poller<br/><i>one call per feed position</i>"]
+        subgraph pairs["One per folder pair"]
+            eng["SyncEngine<br/><i>remote_pass · local_pass · full_check</i>"]
+            db[("State DB<br/><i>SQLite, pair-*.db</i>")]
+        end
+    end
+
+    oplog[/"Operation log<br/><i>operations.log + journal</i>"/]
+    drive[("Google Drive API v3")]
+    disk[("Local sync folders")]
+
+    naut -.->|D-Bus| svc
+    tray -.->|D-Bus| svc
+    disk -->|events| watch
+    watch --> eng
+    poll --> eng
+    eng <--> db
+    eng --> oplog
+    eng <-->|read / write| disk
+    eng <-->|DriveClient| drive
+    poll -->|changes.list| drive
+    cli -->|"same engine, per-pair lock"| eng
 ```
-┌──────────────────────┐   D-Bus    ┌──────────────────────────────┐
-│ Nautilus extension   │◄──────────►│  gdrivesyncd (systemd --user)│
-│ (nautilus-python)    │            │  ┌────────────┐ ┌──────────┐ │
-└──────────────────────┘            │  │ Local      │ │ Remote   │ │
-┌──────────────────────┐            │  │ watcher    │ │ poller   │ │
-│ Tray + settings      │◄──────────►│  │ (inotify)  │ │(changes) │ │
-│ (GTK4 / libadwaita)  │            │  └─────┬──────┘ └────┬─────┘ │
-└──────────────────────┘            │        ▼             ▼       │
-                                    │   Reconciler ◄─► SQLite DB   │
-                                    │        ▼                     │
-                                    │   Transfer queue (up/down)   │
-                                    └──────────────┬───────────────┘
-                                                   ▼
-                                           Google Drive API v3
-```
+
+The CLI and the daemon use the same `SyncEngine`; a per-pair lock keeps them from
+working on one folder at the same time. Dashed lines are planned.
 
 ### Python environments
 

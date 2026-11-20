@@ -191,11 +191,35 @@ Nautilus module itself (interfaces, FileInfo, completion callback) is faked.
 
 ## Tray / settings
 
-- AyatanaAppIndicator (Ubuntu ships the AppIndicator GNOME extension).
-  Menu: status line, Open folder, Pause/Resume, Settings, Quit.
-- libadwaita settings window: account, sync folder, excluded folders, ignore
-  patterns, bandwidth limits, activity log.
-- Notifications via `Gio.Notification` for conflicts and errors.
+Two separate processes on the system Python (PyGObject), because
+libayatana-appindicator is GTK 3 and the settings window is GTK 4 / libadwaita —
+one process can't load both. Launched via `gdrivesync tray` / `gdrivesync
+settings`, which `exec` the system Python on `desktop/gdrivesync_*.py` with
+`GDRIVESYNC_CLI` pointing back at the CLI. Neither imports the gdrivesync package.
+
+- **Shared:** `ui_common.py` (pure Python: overall-status summary, notification
+  rules, autostart entry) and `ui_gio.py` (async Gio D-Bus client following the
+  service, non-blocking CLI/systemctl runner, desktop notifications via
+  `org.freedesktop.Notifications`).
+- **Tray** (`gdrivesync_tray.py`, single instance): icon reflects synced /
+  syncing / paused / error / service-not-running. Menu: status line, open each
+  folder, Sync now, Pause/Resume, Recent activity, Settings…, and "Start syncing"
+  when the service is down. Refreshes on `StatusChanged`/`StateChanged` signals
+  (debounced) and every 10 s. Notifies about new conflicts, new errors, and the
+  service stopping; never about the state it found at startup.
+- **Settings** (`gdrivesync_settings.py`, single instance): Status (overview,
+  per-folder state, problems, recent activity), Folders (add/remove pairs,
+  re-include excluded folders), Settings (poll interval, full-check interval,
+  newer-wins on rebuild, sync at login via `systemctl --user enable`, tray at
+  login via an XDG autostart entry, Files integration, log and ignore file),
+  Account (whoami, sign in again). Reads: D-Bus `GetState` + `gdrivesync config
+  --json`. Writes: the same CLI commands a user would run (so validation and
+  per-pair locking are shared); removing a pair stops the service around
+  `pair remove` because the service holds the pair's lock. Settings changes show
+  a "Restart the sync service" banner.
+- **Testing:** `tests/test_gui.py` runs both UIs under Xvfb against the real
+  service on a private bus, with recording fakes for the CLI and systemctl and a
+  fake notification server; the settings test also saves screenshots.
 
 ## Layout
 
@@ -357,6 +381,6 @@ MD5, or same-named empty folders) and trashes the extras.
    systemd user service. Test against a scratch Google account.
 3. ✅ **D-Bus + Nautilus** — status emblems/column, context menu, link-file
    handler, sidebar bookmarks (needs a check on a real desktop).
-4. **Tray + settings UI.**
+4. ✅ **Tray + settings UI.**
 5. **Hardening** — selective sync, large trees (100k+ files), offline/resume,
    rate limits, `.deb` packaging.

@@ -38,6 +38,13 @@ def test_install_and_uninstall(home, capsys):
     assert "%20" in marks[0]  # space in folder name is URI-encoded
     out = capsys.readouterr().out
     assert "nautilus -q" in out
+    assert " settings" in p["app"].read_text() and "Name=Google Drive Sync" in p["app"].read_text()
+    assert " tray" in p["autostart"].read_text()
+
+    assert cli.main(["config", "--json"]) == 0
+    cfg = json.loads(capsys.readouterr().out)
+    assert cfg["pairs"][0]["name"] == "My Drive" and cfg["desktop"]["extension_installed"]
+    assert cfg["desktop"]["tray_autostart"] is True
 
     cli.main(["install-desktop"])  # idempotent: no duplicate bookmark
     assert len(p["bookmarks"].read_text().splitlines()) == 1
@@ -45,6 +52,7 @@ def test_install_and_uninstall(home, capsys):
     p["bookmarks"].write_text("file:///home/other Other\n" + p["bookmarks"].read_text())
     assert cli.main(["install-desktop", "--uninstall"]) == 0
     assert not p["extension"].exists() and not p["mime"].exists() and not p["desktop"].exists()
+    assert not p["app"].exists() and not p["autostart"].exists()
     assert p["bookmarks"].read_text() == "file:///home/other Other\n"  # others' bookmarks kept
 
 

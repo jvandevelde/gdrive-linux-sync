@@ -201,6 +201,12 @@ class DBusService:
         return "s", (self.index.link(path),)
 
     def _m_GetState(self):
+        from gdrivesync.oplog import describe
+
+        try:
+            remotes = {p.name: p.remote_path for p in config.Settings.load().pairs}
+        except Exception:  # noqa: BLE001 — settings unreadable mid-write: skip
+            remotes = {}
         recent, seen = [], set()
         pairs = []
         for slot in self.daemon.slots:
@@ -209,11 +215,12 @@ class DBusService:
                 key = (e.get("ts"), e.get("op"), e.get("path"), e.get("pair"))
                 if key not in seen:
                     seen.add(key)
-                    recent.append(e)
+                    recent.append({**e, "text": describe({**e, "pair": ""})})
             errors = dict(list(eng.errors.items())[:50])
             pairs.append({
                 "name": eng.name,
                 "local": str(eng.root),
+                "remote": remotes.get(eng.name, ""),
                 "status": self.index.status(str(eng.root)),
                 "paused": slot.disabled,
                 "errors": errors,

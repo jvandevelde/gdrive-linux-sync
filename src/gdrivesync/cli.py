@@ -664,6 +664,33 @@ def cmd_open(args: argparse.Namespace) -> int:
     return 0
 
 
+def _launch_gui(script: str, extra: list[str]) -> int:
+    """Run a desktop UI script on the system Python (which has PyGObject/GTK)."""
+    import os
+    import shutil
+
+    from gdrivesync import desktop_install
+
+    py = desktop_install.system_python()
+    if py is None:
+        print("error: needs the system Python with PyGObject (sudo apt install python3-gi "
+              "gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1)",
+              file=sys.stderr)
+        return 1
+    path = str(desktop_install.desktop_dir() / script)
+    env = dict(os.environ, GDRIVESYNC_CLI=desktop_install.cli_exe())
+    os.execve(py, [py, path, *extra], env)
+    return 0  # not reached
+
+
+def cmd_tray(args: argparse.Namespace) -> int:
+    return _launch_gui("gdrivesync_tray.py", [])
+
+
+def cmd_settings(args: argparse.Namespace) -> int:
+    return _launch_gui("gdrivesync_settings.py", [])
+
+
 def cmd_install_desktop(args: argparse.Namespace) -> int:
     from gdrivesync import desktop_install
 
@@ -671,10 +698,43 @@ def cmd_install_desktop(args: argparse.Namespace) -> int:
     if args.uninstall:
         notes = desktop_install.uninstall(settings)
     else:
-        notes = desktop_install.install(settings, bookmarks=not args.no_bookmarks)
+        notes = desktop_install.install(settings, bookmarks=not args.no_bookmarks,
+                                       tray_autostart=not args.no_tray)
     for n in notes:
         print(n)
     return 0
+
+
+def _config_json(s) -> dict:
+    from gdrivesync import desktop_install
+    from gdrivesync.pairs import excluded_listing
+
+    pairs = []
+    for p in s.pairs:
+        pairs.append({
+            "name": p.name,
+            "local": str(p.root),
+            "remote_path": p.remote_path,
+            "excluded": excluded_listing(p),
+            "last_full_check": _last_full_check(p),
+        })
+    return {
+        "poll_interval_s": s.poll_interval_s,
+        "max_transfers": s.max_transfers,
+        "full_check_hours": s.full_check_hours,
+        "prefer_newer_on_rebuild": s.prefer_newer_on_rebuild,
+        "pairs": pairs,
+        "paths": {
+            "config_dir": str(config.CONFIG_DIR),
+            "operation_log": str(config.OPS_LOG),
+            "ignore_file": str(config.IGNORE_FILE),
+        },
+        "desktop": {
+            "extension_installed": desktop_install.paths()["extension"].exists(),
+            "nautilus_python": desktop_install.nautilus_python_installed(),
+            "tray_autostart": desktop_install.paths()["autostart"].exists(),
+        },
+    }
 
 
 def cmd_config(args: argparse.Namespace) -> int:
@@ -694,6 +754,11 @@ def cmd_config(args: argparse.Namespace) -> int:
         changed = True
     if changed:
         s.save()
+    if args.json:
+        import json
+
+        print(json.dumps(_config_json(s), indent=2))
+        return 0
     print(f"config dir     : {config.CONFIG_DIR}")
     print(f"data dir       : {config.DATA_DIR}")
     print(f"ignore file    : {config.IGNORE_FILE}")
@@ -793,11 +858,18 @@ def build_parser() -> argparse.ArgumentParser:
                          help="install the Nautilus extension, file types and sidebar bookmarks")
     ins.add_argument("--uninstall", action="store_true")
     ins.add_argument("--no-bookmarks", action="store_true", help="don't add sidebar bookmarks")
+    ins.add_argument("--no-tray", action="store_true", help="don't start the tray icon at login")
+
+    tr = sub.add_parser("tray", help="show the status icon in the top bar")
+    tr.set_defaults(func=cmd_tray)
+    st = sub.add_parser("settings", help="open the settings window")
+    st.set_defaults(func=cmd_settings)
     ins.set_defaults(func=cmd_install_desktop)
 
     cfg = sub.add_parser("config", help="show or change settings")
     cfg.add_argument("--poll-interval", type=int, help="seconds between Drive checks")
     cfg.add_argument("--max-transfers", type=int, help="parallel downloads during pull")
+    cfg.add_argument("--json", action="store_true", help="print all settings as JSON")
     cfg.add_argument("--prefer-newer-on-rebuild", choices=["on", "off"],
                      help="when rebuilding sync state, upload newer local files as new versions")
     cfg.add_argument("--full-check-hours", type=float,

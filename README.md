@@ -3,8 +3,9 @@
 Dropbox-style Google Drive sync for Ubuntu, with Nautilus integration.
 Personal project — see [docs/DESIGN.md](docs/DESIGN.md).
 
-**Status:** milestone 3 done — two-way sync of one or more folder pairs as a background
-service, with Nautilus integration. Tray icon and settings window are next.
+**Status:** milestones 1–4 done — two-way sync of one or more folder pairs as a background
+service, Nautilus integration, a top-bar status icon and a settings window. Hardening and
+packaging are next.
 
 ## Setup
 
@@ -65,6 +66,37 @@ sidebar bookmark. `gdrivesync install-desktop --uninstall` removes all of it.
 
 If emblems don't appear, check the service is running (`systemctl --user status
 gdrivesync`) and that Nautilus loaded the extension (`nautilus -q`, then reopen it).
+
+## Status icon and settings window
+
+```sh
+sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-gtk-3.0 \
+                 gir1.2-ayatanaappindicator3-0.1      # usually already there on Ubuntu
+gdrivesync install-desktop      # also adds the app to the grid + status icon at login
+gdrivesync tray &               # start the status icon now
+gdrivesync settings             # or open "Google Drive Sync" from the app grid
+```
+
+The **status icon** shows whether everything is up to date, syncing, paused, has a problem,
+or the service isn't running. Its menu opens your folders, syncs now, pauses/resumes, lists
+recent activity and opens settings. You get a desktop notification when a file was edited in
+two places (and a conflicted copy was kept), when something can't sync, or when the service
+stops.
+
+The **settings window**:
+
+| Status | Folders | Settings |
+|---|---|---|
+| ![Status page](docs/screenshots/settings-status.png) | ![Folders page](docs/screenshots/settings-folders.png) | ![Settings page](docs/screenshots/settings-settings.png) |
+
+- **Status** — overall state, Sync Now / Pause, each folder, problems, recent activity.
+- **Folders** — add or remove folder pairs; bring back folders you stopped syncing locally.
+- **Settings** — how often to check Drive, the daily full check, the rebuild conflict rule,
+  sync and status icon at login, Files integration, operation log and ignore file.
+- **Account** — who you're signed in as, storage, sign in again.
+
+Changes go through the same `gdrivesync` commands described below. Some settings need the
+service restarted; the window offers a button for that.
 
 ## What `pull` does
 

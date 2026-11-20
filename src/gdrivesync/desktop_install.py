@@ -29,6 +29,7 @@ MIME_TYPES = [
     "application/x-gdrivesync-glink",
 ]
 DESKTOP_ID = "gdrivesync-open.desktop"
+APP_ID = "io.github.jvandevelde.GDriveSync"
 BOOKMARK_TAG = "gdrivesync"
 
 
@@ -47,7 +48,61 @@ def paths() -> dict[str, Path]:
         "mime": data / "mime/packages/gdrivesync.xml",
         "desktop": data / "applications" / DESKTOP_ID,
         "bookmarks": _config_home() / "gtk-3.0/bookmarks",  # GTK 4 Nautilus reads it too
+        "app": data / "applications" / f"{APP_ID}.desktop",
+        "autostart": _config_home() / "autostart/gdrivesync-tray.desktop",
     }
+
+
+def desktop_dir() -> Path:
+    return Path(str(resources.files("gdrivesync") / "desktop"))
+
+
+def system_python() -> str | None:
+    """The distro Python that has PyGObject (the venv's Python usually doesn't)."""
+    for exe in ("/usr/bin/python3", "/usr/bin/python3.12", "/usr/bin/python3.13",
+                "/usr/bin/python3.11", "/usr/bin/python3.10"):
+        if os.path.exists(exe) and subprocess.run(
+            [exe, "-c", "import gi"], capture_output=True
+        ).returncode == 0:
+            return exe
+    return None
+
+
+def cli_exe() -> str:
+    found = shutil.which("gdrivesync")
+    if found:
+        return found
+    candidate = Path(sys.executable).parent / "gdrivesync"
+    return str(candidate) if candidate.exists() else "gdrivesync"
+
+
+def app_entry(cli: str) -> str:
+    return "\n".join([
+        "[Desktop Entry]",
+        "Type=Application",
+        "Name=Google Drive Sync",
+        "Comment=Settings and status for gdrivesync",
+        f"Exec={cli} settings",
+        "Icon=folder-remote",
+        "Categories=Network;FileTransfer;GTK;",
+        "Keywords=google;drive;sync;cloud;",
+        "StartupNotify=true",
+        "",
+    ])
+
+
+def tray_autostart_entry(cli: str) -> str:
+    return "\n".join([
+        "[Desktop Entry]",
+        "Type=Application",
+        "Name=Google Drive Sync status icon",
+        f"Exec={cli} tray",
+        "Icon=folder-remote",
+        "NoDisplay=true",
+        "X-GNOME-Autostart-enabled=true",
+        "X-GNOME-Autostart-Delay=5",
+        "",
+    ])
 
 
 def nautilus_python_installed() -> bool:
@@ -89,7 +144,8 @@ def _bookmark_lines(settings: config.Settings) -> list[str]:
     return [f"{p.root.resolve().as_uri()} {p.name}" for p in settings.pairs]
 
 
-def install(settings: config.Settings, *, bookmarks: bool = True) -> list[str]:
+def install(settings: config.Settings, *, bookmarks: bool = True,
+            tray_autostart: bool = True) -> list[str]:
     """Install everything; returns human-readable notes."""
     notes = []
     p = paths()
@@ -108,6 +164,14 @@ def install(settings: config.Settings, *, bookmarks: bool = True) -> list[str]:
     for mt in MIME_TYPES:
         _run(["xdg-mime", "default", DESKTOP_ID, mt])
     notes.append("Google Docs link files (.gdoc, .gsheet, …) now open in the browser")
+
+    cli = cli_exe()
+    p["app"].write_text(app_entry(cli))
+    notes.append("“Google Drive Sync” settings app added to the app grid")
+    if tray_autostart:
+        p["autostart"].parent.mkdir(parents=True, exist_ok=True)
+        p["autostart"].write_text(tray_autostart_entry(cli))
+        notes.append("Status icon starts at login (start it now: gdrivesync tray &)")
 
     if bookmarks and settings.pairs:
         existing = p["bookmarks"].read_text().splitlines() if p["bookmarks"].exists() else []
@@ -128,7 +192,7 @@ def install(settings: config.Settings, *, bookmarks: bool = True) -> list[str]:
 def uninstall(settings: config.Settings) -> list[str]:
     p = paths()
     removed = []
-    for key in ("extension", "mime", "desktop"):
+    for key in ("extension", "mime", "desktop", "app", "autostart"):
         if p[key].exists():
             p[key].unlink()
             removed.append(str(p[key]))

@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Link files gdrivesync writes for Google-native documents. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-gdrivesync-gdoc">
+    <comment>Google Docs document</comment>
+    <sub-class-of type="application/json"/>
+    <generic-icon name="x-office-document"/>
+    <glob pattern="*.gdoc"/>
+  </mime-type>
+  <mime-type type="application/x-gdrivesync-gsheet">
+    <comment>Google Sheets spreadsheet</comment>
+    <sub-class-of type="application/json"/>
+    <generic-icon name="x-office-spreadsheet"/>
+    <glob pattern="*.gsheet"/>
+  </mime-type>
+  <mime-type type="application/x-gdrivesync-gslides">
+    <comment>Google Slides presentation</comment>
+    <sub-class-of type="application/json"/>
+    <generic-icon name="x-office-presentation"/>
+    <glob pattern="*.gslides"/>
+  </mime-type>
+  <mime-type type="application/x-gdrivesync-gdraw">
+    <comment>Google Drawings drawing</comment>
+    <sub-class-of type="application/json"/>
+    <generic-icon name="image-x-generic"/>
+    <glob pattern="*.gdraw"/>
+  </mime-type>
+  <mime-type type="application/x-gdrivesync-gform">
+    <comment>Google Forms form</comment>
+    <sub-class-of type="application/json"/>
+    <generic-icon name="x-office-document"/>
+    <glob pattern="*.gform"/>
+  </mime-type>
+  <mime-type type="application/x-gdrivesync-glink">
+    <comment>Google Drive item</comment>
+    <sub-class-of type="application/json"/>
+    <generic-icon name="text-html"/>
+    <glob pattern="*.gmap"/>
+    <glob pattern="*.gsite"/>
+    <glob pattern="*.gjam"/>
+    <glob pattern="*.glink"/>
+  </mime-type>
+</mime-info>

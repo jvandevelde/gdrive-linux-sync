@@ -12,6 +12,7 @@ dependencies = [
     "google-api-python-client>=2.100",
     "google-auth-oauthlib>=1.1",
     "watchdog>=4.0",
+    "jeepney>=0.8",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +23,9 @@ gdrivesync = "gdrivesync.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+gdrivesync = ["desktop/*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

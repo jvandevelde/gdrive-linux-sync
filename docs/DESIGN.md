@@ -134,28 +134,60 @@ syntax). Excluded remote folders (selective sync) stored in config.
 
 ## D-Bus API (session bus)
 
-Name: `io.github.jvandevelde.GDriveSync`, object `/io/github/jvandevelde/GDriveSync`
+Name `io.github.jvandevelde.GDriveSync`, object `/io/github/jvandevelde/GDriveSync`,
+same interface name. Served by `dbus_service.py` (jeepney) on its own thread with
+its own read-only DB connection per pair, so status lookups never wait for a
+transfer; anything that changes state runs on the sync thread via
+`Daemon.call_soon()`. Try it: `busctl --user introspect io.github.jvandevelde.GDriveSync
+/io/github/jvandevelde/GDriveSync`.
 
 | Member | Signature | Purpose |
 |---|---|---|
-| `GetFileStatus(path)` | `s → s` | `synced` / `syncing` / `error` / `conflict` / `ignored` / `unknown` |
-| `GetFileStatuses(paths)` | `as → a{ss}` | Batched, for directory views |
-| `GetShareLink(path)` | `s → s` | `webViewLink` |
-| `Pause()` / `Resume()` | | |
-| `GetState()` | `→ a{sv}` | overall state, queue sizes, last error |
-| signal `StatusChanged(paths)` | `as` | Nautilus calls `invalidate_extension_info()` on affected files |
+| `GetRoots()` | `→ as` | local folders of all pairs |
+| `GetFileStatus(path)` | `s → s` | `synced` / `syncing` / `error` / `conflict` / `ignored` / `""` (not ours / missing) |
+| `GetFileStatuses(paths)` | `as → a{ss}` | batched |
+| `GetDriveLink(path)` | `s → s` | drive.google.com URL (`""` if not on Drive yet) |
+| `GetState()` | `→ s` | JSON: paused, per-pair status/errors/active transfers, recent operations |
+| `SyncNow()`, `Pause()`, `Resume()` | | |
+| `Exclude(path)` / `Include(path)` | `s → s` | selective sync from the file manager; persisted to settings |
+| signal `StatusChanged(paths)` | `as` | changed paths **and their ancestor folders** (batched every 0.3 s) |
+| signal `StateChanged()` | | paused/resumed |
+
+Status is derived on demand (`status.py`): ignored by rules → `ignored`; in the
+engine's error map → `error`; being transferred (engine `active` set) → `syncing`;
+"conflicted copy" name → `conflict`; untracked or changed since the last sync →
+`syncing`; else `synced`. Folders are `error` if anything inside failed. The
+engine notifies listeners on every operation, transfer start/end, and error
+set/clear; the daemon maps those to absolute paths for the signal.
 
 ## Nautilus extension
 
-`nautilus/gdrivesync_nautilus.py`, installed to
-`~/.local/share/nautilus-python/extensions/` (needs `python3-nautilus`).
+`src/gdrivesync/desktop/gdrivesync_nautilus.py`, installed by
+`gdrivesync install-desktop` into `~/.local/share/nautilus-python/extensions/`
+(needs `python3-nautilus`). System Python + PyGObject only; works with the
+Nautilus 4 (GTK 4) and 3 extension APIs.
 
-- **InfoProvider** — emblem per file under the sync root + a "Sync status"
-  column (ColumnProvider) as fallback, since emblem display in GTK4-era Nautilus
-  is limited. **To verify on the target Ubuntu release.**
-- **MenuProvider** — Copy share link, Open in Google Drive, Exclude from sync.
-- Must never block the UI: D-Bus calls are async with a short timeout; unknown
-  status is shown as nothing.
+- **InfoProvider** (`update_file_info_full`, async) — emblem per item
+  (`emblem-default`, `emblem-synchronizing`, `emblem-important`) plus a
+  **ColumnProvider** "Sync status" column, in case the emblems aren't shown in
+  the current view. **Emblem display still to be verified on a real Ubuntu desktop.**
+- Tracks the service with `Gio.bus_watch_name`: emblems appear when it starts and
+  clear when it stops. `StatusChanged` → `invalidate_extension_info()` on the
+  files it has seen (bounded cache).
+- **MenuProvider** — single selection inside a synced folder: Open in Google
+  Drive, Copy Google Drive Link, and for sub-folders "Remove Local Copy (Keep on
+  Drive)…" (confirmation dialog → `Exclude`). Folder background: "Sync with Google
+  Drive Now".
+- Never blocks: all D-Bus calls are async with a 3 s timeout; no status → no emblem.
+
+`install-desktop` also registers MIME types for the link files
+(`application/x-gdrivesync-gdoc`, …) with a hidden handler running
+`gdrivesync open %f` (opens the URL in the browser), and adds a sidebar bookmark
+per pair. `--uninstall` reverts it.
+
+**Testing:** `tests/test_nautilus_ext.py` runs the real extension on the system
+Python (PyGObject) against the real service on a private session bus; only the
+Nautilus module itself (interfaces, FileInfo, completion callback) is faked.
 
 ## Tray / settings
 
@@ -168,14 +200,21 @@ Name: `io.github.jvandevelde.GDriveSync`, object `/io/github/jvandevelde/GDriveS
 ## Layout
 
 ```
-src/gdrivesync/     daemon + CLI package
-  cli.py            `gdrivesync` command
-  config.py         paths & settings
-  auth.py           OAuth
-  drive.py          Drive API wrapper
-  state.py          SQLite state DB
-nautilus/           Nautilus extension (system Python, gi only)
-packaging/systemd/  user service unit
+src/gdrivesync/
+  cli.py             `gdrivesync` command
+  config.py          paths, settings, folder pairs
+  auth.py            OAuth
+  drive.py           Drive API wrapper
+  state.py           SQLite state DB, integrity check, per-pair lock
+  pull.py            initial download / rebuild
+  engine.py          two-way sync engine (+ dry run)
+  daemon.py          background service loop
+  status.py          per-path sync status
+  dbus_service.py    D-Bus API
+  oplog.py           operation log
+  pairs.py, doctor.py, localfs.py, names.py, desktop_install.py
+  desktop/           Nautilus extension + MIME types (installed by install-desktop)
+packaging/systemd/   user service unit
 tests/
 docs/
 ```
@@ -316,7 +355,8 @@ MD5, or same-named empty folders) and trashes the extras.
    My Drive into the sync folder, populate state DB, `.gdoc` stubs.
 2. ✅ **Two-way engine** — local watcher, changes poller, reconciler, conflicts,
    systemd user service. Test against a scratch Google account.
-3. **D-Bus + Nautilus** — status emblems/column, context menu.
+3. ✅ **D-Bus + Nautilus** — status emblems/column, context menu, link-file
+   handler, sidebar bookmarks (needs a check on a real desktop).
 4. **Tray + settings UI.**
 5. **Hardening** — selective sync, large trees (100k+ files), offline/resume,
    rate limits, `.deb` packaging.

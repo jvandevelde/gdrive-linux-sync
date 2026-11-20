@@ -3,8 +3,8 @@
 Dropbox-style Google Drive sync for Ubuntu, with Nautilus integration.
 Personal project — see [docs/DESIGN.md](docs/DESIGN.md).
 
-**Status:** milestone 2 done — two-way sync of one or more folder pairs as a background
-service. Nautilus integration is next.
+**Status:** milestone 3 done — two-way sync of one or more folder pairs as a background
+service, with Nautilus integration. Tray icon and settings window are next.
 
 ## Setup
 
@@ -41,6 +41,30 @@ service. Nautilus integration is next.
 > Note: with the consent screen in "Testing" mode, refresh tokens expire after
 > 7 days. Publishing the app to "In production" (unverified is fine for
 > personal use) avoids that; you'll just see an "unverified app" warning once.
+
+## Nautilus (Files) integration
+
+```sh
+sudo apt install python3-nautilus     # once: lets Nautilus load Python extensions
+gdrivesync install-desktop            # extension, file types, sidebar bookmarks
+nautilus -q                           # restart Files to load it
+```
+
+With the service running, items in your synced folders get:
+
+- **an emblem** — ✓ up to date, ⟳ syncing, ! error or conflicted copy — and a
+  **"Sync status" column** in list view (right-click the column header to add it);
+- **right-click → Open in Google Drive / Copy Google Drive Link**;
+- on sub-folders, **Remove Local Copy (Keep on Drive)…** — selective sync, after
+  a confirmation (undo with `gdrivesync exclude remove <path>`);
+- on the folder background, **Sync with Google Drive Now**.
+
+Double-clicking a `.gdoc` / `.gsheet` / `.gslides` file opens it in your browser
+(`gdrivesync open <file>` does the same from a terminal). Each synced folder also gets a
+sidebar bookmark. `gdrivesync install-desktop --uninstall` removes all of it.
+
+If emblems don't appear, check the service is running (`systemctl --user status
+gdrivesync`) and that Nautilus loaded the extension (`nautilus -q`, then reopen it).
 
 ## What `pull` does
 

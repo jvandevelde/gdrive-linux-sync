@@ -138,7 +138,16 @@ _COLS = list(Item.__dataclass_fields__)
 
 
 class StateDB:
-    def __init__(self, path: Path | str):
+    def __init__(self, path: Path | str, *, readonly: bool = False):
+        self.path = path
+        if readonly:
+            # A separate reader (e.g. the D-Bus status thread): never blocks on or
+            # interferes with the sync thread's writes (WAL mode).
+            self.conn = sqlite3.connect(
+                f"file:{Path(path)}?mode=ro", uri=True, check_same_thread=False
+            )
+            self.conn.row_factory = sqlite3.Row
+            return
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(path), check_same_thread=False)

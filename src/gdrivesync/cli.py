@@ -503,14 +503,15 @@ def cmd_daemon(args: argparse.Namespace) -> int:
     def rebuild(engine):
         from gdrivesync.state import quarantine
 
-        pair = settings.pair(engine.name)
+        fresh = config.Settings.load()  # exclusions may have changed since start
+        pair = fresh.pair(engine.name)
         try:
             engine.db.close()
         except Exception:  # noqa: BLE001
             pass
         moved = quarantine(pair.db_path, "corrupt")
         logging.getLogger("gdrivesync").error("[%s] corrupted state kept as %s", pair.name, moved)
-        return _build_engine(settings, pair, client, oplog)
+        return _build_engine(fresh, pair, client, oplog)
 
     d = Daemon(
         engines,
@@ -519,7 +520,14 @@ def cmd_daemon(args: argparse.Namespace) -> int:
         rebuild=rebuild,
     )
     d.install_signal_handlers()
-    d.run()
+    from gdrivesync.dbus_service import DBusService
+
+    api = DBusService(d)
+    api.start()
+    try:
+        d.run()
+    finally:
+        api.stop()
     return 0
 
 
@@ -615,6 +623,57 @@ def cmd_log(args: argparse.Namespace) -> int:
                         pos = fh.tell()
         except KeyboardInterrupt:
             pass
+    return 0
+
+
+def cmd_open(args: argparse.Namespace) -> int:
+    """Open a .gdoc/.gsheet/… link file (or any synced item) in the browser."""
+    import json
+    import webbrowser
+
+    path = Path(args.path).expanduser()
+    url = None
+    try:
+        data = json.loads(path.read_text()) if path.is_file() and path.stat().st_size < 4096 else {}
+        url = data.get("url") if isinstance(data, dict) else None
+    except (OSError, ValueError, UnicodeDecodeError):
+        url = None
+    if not url:
+        from gdrivesync.pairs import PairError, _locate
+        from gdrivesync.state import StateDB
+        from gdrivesync.status import drive_link
+
+        try:
+            pair, rel = _locate(config.Settings.load(), path)
+        except PairError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        db = StateDB(pair.db_path, readonly=True)
+        try:
+            item = db.by_path(rel)
+        finally:
+            db.close()
+        if item is None:
+            print(f"error: {path} isn't on Google Drive yet", file=sys.stderr)
+            return 1
+        url = drive_link(item)
+    if args.print:
+        print(url)
+    else:
+        webbrowser.open(url)
+    return 0
+
+
+def cmd_install_desktop(args: argparse.Namespace) -> int:
+    from gdrivesync import desktop_install
+
+    settings = config.Settings.load()
+    if args.uninstall:
+        notes = desktop_install.uninstall(settings)
+    else:
+        notes = desktop_install.install(settings, bookmarks=not args.no_bookmarks)
+    for n in notes:
+        print(n)
     return 0
 
 
@@ -724,6 +783,17 @@ def build_parser() -> argparse.ArgumentParser:
     dr = sub.add_parser("doctor", help="find duplicate files/folders on Drive")
     dr.add_argument("--fix", action="store_true", help="move the duplicates to the trash")
     dr.set_defaults(func=cmd_doctor)
+
+    op = sub.add_parser("open", help="open a Google Docs link file or synced item in the browser")
+    op.add_argument("path")
+    op.add_argument("--print", action="store_true", help="print the URL instead of opening it")
+    op.set_defaults(func=cmd_open)
+
+    ins = sub.add_parser("install-desktop",
+                         help="install the Nautilus extension, file types and sidebar bookmarks")
+    ins.add_argument("--uninstall", action="store_true")
+    ins.add_argument("--no-bookmarks", action="store_true", help="don't add sidebar bookmarks")
+    ins.set_defaults(func=cmd_install_desktop)
 
     cfg = sub.add_parser("config", help="show or change settings")
     cfg.add_argument("--poll-interval", type=int, help="seconds between Drive checks")

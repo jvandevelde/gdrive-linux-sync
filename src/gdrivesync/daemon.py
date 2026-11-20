@@ -112,11 +112,45 @@ class Daemon:
         self._stop = threading.Event()
         self._observer: Observer | None = None
         self.paused = False
+        self._poll_now = False
+        # Called with absolute paths whose sync status may have changed (D-Bus).
+        self.status_listeners: list = []
+        for slot in self.slots:
+            self._wire(slot.engine)
+
+    def _wire(self, engine: SyncEngine) -> None:
+        root = str(engine.root)
+
+        def changed(rels: list[str]) -> None:
+            paths = [root if not r else f"{root}/{r}" for r in rels]
+            for fn in list(self.status_listeners):
+                try:
+                    fn(paths)
+                except Exception:  # noqa: BLE001
+                    log.exception("status listener failed")
+
+        engine.listeners.append(changed)
 
     # ---------------------------------------------------------------- control
     def stop(self) -> None:
         self._stop.set()
         self.q.put(("stop", None, None))
+
+    def call_soon(self, fn) -> None:
+        """Run fn on the sync thread (the only thread that may touch engines)."""
+        self.q.put(("call", None, fn))
+
+    def sync_now(self) -> None:
+        """Scan every folder and poll Drive right away."""
+        def go():
+            now = time.monotonic()
+            for slot in self._active():
+                slot.first_dirty, slot.last_event = now, now - DEBOUNCE_S
+            self._poll_now = True
+        self.call_soon(go)
+
+    def slot_for(self, pair_name: str) -> "_Slot | None":
+        return next((s for s in self.slots if s.engine.name == pair_name), None)
 
     def install_signal_handlers(self) -> None:
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -161,6 +195,7 @@ class Daemon:
             return
         try:
             slot.engine = self.rebuild(eng)
+            self._wire(slot.engine)
         except Exception:  # noqa: BLE001
             slot.disabled = True
             log.exception("[%s] rebuild failed; this folder is paused until restart",
@@ -291,6 +326,10 @@ class Daemon:
                         kind, idx, payload = item
                         if kind == "stop":
                             return
+                        if kind == "call":
+                            self._safe("command", payload)
+                            item = self.q.get_nowait()
+                            continue
                         slot = self.slots[idx]
                         if kind == "move":
                             slot.moves.append(payload)
@@ -307,6 +346,9 @@ class Daemon:
                     if slot.due(now):
                         self._local(slot, now)
 
+                if self._poll_now:
+                    self._poll_now = False
+                    next_remote = now
                 if now >= next_remote:
                     if self.poll_remote():
                         remote_failures = 0

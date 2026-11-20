@@ -24,7 +24,8 @@ import posixpath
 import shutil
 import stat as statmod
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -121,6 +122,9 @@ class SyncEngine:
         self._vgone: set[str] = set()
         self._vcreated: set[str] = set()
         self._dry_ids = 0
+        # For status reporting (read from the D-Bus thread):
+        self.active: set[str] = set()  # rel paths being transferred right now
+        self.listeners: list[Callable[[list[str]], None]] = []  # called with changed rels
         self.client = client
         self.db = db
         self.root = Path(root).expanduser().resolve()
@@ -162,6 +166,31 @@ class SyncEngine:
 
     def _op(self, op: str, path: str, **detail) -> None:
         self.oplog.record(op, path, pair=self.name, **detail)
+        self._notify(path, detail.get("src"))
+
+    def _notify(self, *rels: str | None) -> None:
+        changed = [r for r in rels if r is not None]
+        if not changed or self.dry_run:
+            return
+        for fn in list(self.listeners):
+            try:
+                fn(changed)
+            except Exception:  # noqa: BLE001 — never let a UI hook break syncing
+                log.exception("status listener failed")
+
+    @contextmanager
+    def _activity(self, rel: str):
+        """Mark rel as 'syncing' for the duration of a transfer."""
+        if self.dry_run:
+            yield
+            return
+        self.active.add(rel)
+        self._notify(rel)
+        try:
+            yield
+        finally:
+            self.active.discard(rel)
+            self._notify(rel)
 
     def _fx_download(self, f: dict, rel: str):
         size = int(f.get("size", 0))
@@ -172,7 +201,8 @@ class SyncEngine:
             self._vcreated.add(rel)
             ts = rfc3339_to_ts(f["modifiedTime"]) if f.get("modifiedTime") else 0
             return FakeStat(size, int(ts * 1e9))
-        st = download_file(self.client, f, self.root / rel, self.tmp)
+        with self._activity(rel):
+            st = download_file(self.client, f, self.root / rel, self.tmp)
         self._op("download", rel, file_id=f["id"], size=st.st_size, md5=f.get("md5Checksum"))
         return st
 
@@ -244,7 +274,8 @@ class SyncEngine:
                 "mimeType": mimetypes.guess_type(name)[0] or "application/octet-stream",
                 "md5Checksum": md5_file(path), "size": str(size),
             }
-        f = self.client.upload_new(path, name, parent_id, mtime=mtime, file_id=file_id)
+        with self._activity(rel):
+            f = self.client.upload_new(path, name, parent_id, mtime=mtime, file_id=file_id)
         self._op("upload", rel, file_id=f["id"], size=int(f.get("size", 0)), md5=f.get("md5Checksum"))
         return f
 
@@ -256,7 +287,8 @@ class SyncEngine:
                                                       "mimeType": "application/octet-stream"})
             f.update(md5Checksum=md5_file(path), size=str(size))
             return f
-        f = self.client.update_content(file_id, path, mtime=mtime)
+        with self._activity(rel):
+            f = self.client.update_content(file_id, path, mtime=mtime)
         self._op("update", rel, file_id=file_id, size=int(f.get("size", 0)), md5=f.get("md5Checksum"))
         return f
 
@@ -353,9 +385,11 @@ class SyncEngine:
         log.error("%s: %s", rel, msg)
         self.errors[rel] = msg
         self._stats.errors.append((rel, msg))
+        self._notify(rel)
 
     def _ok(self, rel: str) -> None:
-        self.errors.pop(rel, None)
+        if self.errors.pop(rel, None) is not None:
+            self._notify(rel)
 
     # ================================================================ remote → local
 
@@ -464,9 +498,22 @@ class SyncEngine:
         try:
             self._apply_remote_one(fid, f)
         except Exception as e:  # noqa: BLE001 — keep going, retry later
-            name = (f or {}).get("name", fid)
-            self._fail(name, e)
+            self._fail(self._rel_for_error(fid, f), e)
             failed.append(fid)
+
+    def _rel_for_error(self, fid: str, f: dict | None) -> str:
+        """Best guess at the local path an item maps to, for error reporting."""
+        item = self.db.by_id(fid)
+        if item is not None:
+            return item.rel_path
+        if f and f.get("parents"):
+            parent_rel = self._parent_rel(f["parents"][0])
+            if parent_rel is not None:
+                try:
+                    return self._local_name(f, parent_rel)
+                except Exception:  # noqa: BLE001
+                    pass
+        return (f or {}).get("name", fid)
 
     def _apply_remote_one(self, fid: str, f: dict | None) -> None:
         if fid == self.root_id:

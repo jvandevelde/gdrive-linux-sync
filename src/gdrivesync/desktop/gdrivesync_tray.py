@@ -25,7 +25,9 @@ except (ValueError, ImportError):
     AppIndicator = None
 
 import ui_gio  # noqa: E402
-from ui_common import APP_ID, SERVICE_UNIT, NotificationTracker, sentence, short_time, summarize  # noqa: E402
+from ui_common import (  # noqa: E402
+    APP_ID, SERVICE_UNIT, NotificationTracker, cli_command, sentence, short_time, summarize,
+)  # noqa: E402
 
 REFRESH_S = 10
 RECENT_ITEMS = 8
@@ -84,6 +86,7 @@ class Tray:
         s = self.state or {}
         return (
             self.state is None,
+            self.summary.state == "error",
             bool(s.get("paused")),
             tuple(p["name"] for p in s.get("pairs", [])),
             tuple((e.get("ts"), e.get("path")) for e in s.get("recent", [])[-RECENT_ITEMS:]),
@@ -99,7 +102,11 @@ class Tray:
             self.menu.remove(child)
         self.items = {}
 
-        self.status_item = self._add("status", self.summary.label, None, sensitive=False)
+        if self.summary.state == "error":  # clickable: shows what went wrong
+            self.status_item = self._add("status", self.summary.label,
+                                         lambda _w: self.open_settings("--page", "log", "--problems"))
+        else:
+            self.status_item = self._add("status", self.summary.label, None, sensitive=False)
         state = self.state
         if state is None:
             self._add("start", "Start syncing", self.start_service)
@@ -125,6 +132,7 @@ class Tray:
                 self.menu.append(top)
                 self.items["recent"] = top
         self._sep()
+        self._add("log", "Show log…", lambda _w: self.open_settings("--page", "log"))
         self._add("settings", "Settings…", lambda _w: self.open_settings())
         self._add("quit", "Hide status icon", lambda _w: self.app.quit())
         self.menu.show_all()
@@ -161,8 +169,8 @@ class Tray:
                 ui_gio.notify("Couldn't start syncing", err or "systemctl failed")
         ui_gio.systemctl(["start", SERVICE_UNIT], done)
 
-    def open_settings(self):
-        ui_gio.run_cli(["settings"])
+    def open_settings(self, *args):
+        ui_gio.spawn(cli_command() + ["settings", *args])
 
 
 class TrayApp(Gtk.Application):

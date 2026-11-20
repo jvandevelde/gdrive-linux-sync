@@ -23,11 +23,118 @@ from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 import ui_gio  # noqa: E402
 from ui_common import (  # noqa: E402
-    APP_ID, SERVICE_UNIT, autostart_entry, autostart_path, cli_command, sentence, short_time,
-    summarize,
+    APP_ID, SERVICE_UNIT, autostart_entry, autostart_path, cli_command, journal_argv, log_time,
+    ops_argv, parse_journal_line, parse_ops_line, sentence, short_time, summarize,
 )
 
 APPLY_DELAY_MS = 700
+MAX_LOG_ROWS = 2000
+
+
+def parse_args(argv):
+    """`--page NAME [--problems]` (from `gdrivesync settings` or the tray)."""
+    page, problems = None, False
+    it = iter(argv)
+    for a in it:
+        if a == "--page":
+            page = next(it, None)
+        elif a == "--problems":
+            problems = True
+    return page, problems
+
+
+class LogView:
+    """A live log (the service's journal, or the operation log) in a list,
+    newest first, with search and a 'problems only' filter."""
+
+    def __init__(self, argv_fn, parse, unavailable, empty):
+        self.argv_fn, self.parse, self.unavailable, self.empty = argv_fn, parse, unavailable, empty
+        self.rows: list = []  # newest first
+        self.query = ""
+        self.problems_only = False
+        self.stream = None
+        self.finished = False
+        self.listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.listbox.add_css_class("boxed-list")
+        self.listbox.set_filter_func(self._filter)
+        self.placeholder = Gtk.Label(label="Loading…", wrap=True, margin_top=24,
+                                     margin_bottom=24, margin_start=12, margin_end=12)
+        self.placeholder.add_css_class("dim-label")
+        self.listbox.set_placeholder(self.placeholder)
+        clamp = Adw.Clamp(maximum_size=960, child=self.listbox, margin_top=6,
+                          margin_bottom=18, margin_start=12, margin_end=12)
+        self.scroller = Gtk.ScrolledWindow(vexpand=True, child=clamp)
+        self.scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+
+    def start(self):
+        if self.stream is None and not self.finished:
+            self.stream = ui_gio.LineStream(self.argv_fn(), self._line, self._exit)
+            # A follow with nothing to show just waits: don't say "Loading…" forever.
+            GLib.timeout_add(2000, self._still_empty)
+
+    def _still_empty(self):
+        if not self.rows and not self.finished:
+            self.placeholder.set_label(self.empty)
+        return False
+
+    def stop(self):
+        if self.stream is not None:
+            self.stream.stop()
+            self.stream = None
+
+    def _line(self, line):
+        entry = self.parse(line)
+        if entry is None:
+            return
+        row = self._row(entry)
+        self.listbox.prepend(row)
+        self.rows.insert(0, row)
+        while len(self.rows) > MAX_LOG_ROWS:
+            self.listbox.remove(self.rows.pop())
+        self._update_placeholder()
+
+    def _exit(self, ok, message):
+        self.stream = None
+        self.finished = True
+        if not self.rows:
+            self.placeholder.set_label(self.unavailable + (f"\n{message}" if message else ""))
+
+    def _row(self, e):
+        r = Gtk.ListBoxRow(activatable=False)
+        r.entry = e
+        box = Gtk.Box(spacing=12, margin_top=8, margin_bottom=8, margin_start=12, margin_end=12)
+        t = Gtk.Label(label=log_time(e.ts), xalign=0, valign=Gtk.Align.START, width_chars=8)
+        t.add_css_class("dim-label")
+        t.add_css_class("numeric")
+        m = Gtk.Label(label=e.text, xalign=0, hexpand=True, wrap=True, selectable=True,
+                      wrap_mode=2)  # Pango.WrapMode.WORD_CHAR
+        if e.level in ("error", "warning"):
+            m.add_css_class(e.level)
+        box.append(t)
+        box.append(m)
+        r.set_child(box)
+        return r
+
+    def _filter(self, row):
+        e = row.entry
+        if self.problems_only and not e.problem:
+            return False
+        return not self.query or self.query in e.text.lower()
+
+    def refilter(self):
+        self.listbox.invalidate_filter()
+        self._update_placeholder()
+
+    def _update_placeholder(self):
+        if self.rows:
+            self.placeholder.set_label("Nothing matches")
+
+    def visible(self) -> list:
+        """Shown entries, oldest first."""
+        return [r.entry for r in reversed(self.rows) if self._filter(r)]
+
+    def visible_text(self) -> str:
+        return "\n".join(f"{log_time(e.ts)}  {e.text}" for e in self.visible())
 
 
 class Section:
@@ -103,6 +210,7 @@ class SettingsWindow(Adw.ApplicationWindow):
 
         self._build_status_page()
         self._build_folders_page()
+        self._build_log_page()
         self._build_settings_page()
         self._build_account_page()
 
@@ -192,6 +300,8 @@ class SettingsWindow(Adw.ApplicationWindow):
         self.overview.group.add(self.overview_row)
         self.folders_status = Section(page, "Folders")
         self.problems = Section(page, "Problems")
+        self.problems.group.set_header_suffix(
+            button("Show Log", on_click=lambda: self.show_page("log", problems=True)))
         self.activity = Section(page, "Recent activity")
 
     def toggle_pause(self):
@@ -426,6 +536,93 @@ class SettingsWindow(Adw.ApplicationWindow):
         if restart:
             self.restart_service()
 
+    # ================================================================ log page
+    def _build_log_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.stack.add_titled_with_icon(box, "log", "Log", "text-x-generic-symbolic")
+
+        bar = Gtk.Box(spacing=6, margin_top=12, margin_bottom=6, margin_start=12, margin_end=12)
+        bar_clamp = Adw.Clamp(maximum_size=960, child=bar)
+        seg = Gtk.Box()
+        seg.add_css_class("linked")
+        self.view_journal = Gtk.ToggleButton(label="Service log", active=True,
+                                             tooltip_text="What the sync service reported")
+        self.view_ops = Gtk.ToggleButton(label="Operations", group=self.view_journal,
+                                         tooltip_text="Every change made to your files")
+        seg.append(self.view_journal)
+        seg.append(self.view_ops)
+        self.log_search = Gtk.SearchEntry(placeholder_text="Search", hexpand=True)
+        self.problems_toggle = Gtk.ToggleButton(label="Warnings & errors")
+        copy = button(icon="edit-copy-symbolic", tooltip="Copy what's shown", css=[],
+                      on_click=self.copy_log)
+        self.open_ops_btn = button(icon="document-open-symbolic", css=[],
+                                   tooltip="Open the operation log file",
+                                   on_click=lambda: self._open_cfg_path("operation_log"))
+        for w in (seg, self.log_search, self.problems_toggle, copy, self.open_ops_btn):
+            bar.append(w)
+        box.append(bar_clamp)
+
+        self.journal_view = LogView(
+            journal_argv, parse_journal_line,
+            "The service log isn't available (it needs systemd's journalctl).",
+            "Nothing logged yet — entries appear here as the sync service runs.")
+        self.ops_view = LogView(ops_argv, parse_ops_line, "Couldn't read the operation log.",
+                                "No changes have been made yet.")
+        self.log_stack = Gtk.Stack(vexpand=True)
+        self.log_stack.add_named(self.journal_view.scroller, "journal")
+        self.log_stack.add_named(self.ops_view.scroller, "ops")
+        box.append(self.log_stack)
+
+        for b in (self.view_journal, self.view_ops):
+            b.connect("toggled", lambda btn: btn.get_active() and self._log_view_changed())
+        self.log_search.connect("search-changed", self._log_filter_changed)
+        self.problems_toggle.connect("toggled", self._log_filter_changed)
+        self.stack.connect("notify::visible-child-name", self._page_changed)
+        self.connect("close-request", self._stop_logs)
+        self._log_view_changed()
+
+    def _page_changed(self, *_):
+        if self.stack.get_visible_child_name() == "log":
+            self.journal_view.start()
+            self.ops_view.start()
+
+    def _stop_logs(self, *_):
+        self.journal_view.stop()
+        self.ops_view.stop()
+        return False
+
+    def current_log(self) -> LogView:
+        return self.ops_view if self.view_ops.get_active() else self.journal_view
+
+    def _log_view_changed(self, *_):
+        ops = self.view_ops.get_active()
+        self.log_stack.set_visible_child_name("ops" if ops else "journal")
+        self.problems_toggle.set_label("Deletions & conflicts" if ops else "Warnings & errors")
+        self.open_ops_btn.set_visible(ops)
+
+    def _log_filter_changed(self, *_):
+        query = self.log_search.get_text().strip().lower()
+        for v in (self.journal_view, self.ops_view):
+            v.query = query
+            v.problems_only = self.problems_toggle.get_active()
+            v.refilter()
+
+    def copy_log(self):
+        view = self.current_log()
+        text = view.visible_text()
+        ui_gio.set_clipboard(text)
+        self.toast(f"Copied {len(view.visible())} lines")
+
+    def show_page(self, name, problems=False, view=None):
+        self.stack.set_visible_child_name(name)
+        if name == "log":
+            if view == "ops":
+                self.view_ops.set_active(True)
+            elif view == "journal" or problems:
+                self.view_journal.set_active(True)
+            self.problems_toggle.set_active(problems)
+            self._page_changed()
+
     # ================================================================ settings page
     def _build_settings_page(self):
         page = Adw.PreferencesPage()
@@ -468,7 +665,8 @@ class SettingsWindow(Adw.ApplicationWindow):
 
         adv = Adw.PreferencesGroup(title="Advanced")
         self.log_row = row("Operation log", "Every change made, as JSON lines")
-        self.log_row.add_suffix(button(icon="document-open-symbolic", tooltip="Open",
+        self.log_row.add_suffix(button("View", on_click=lambda: self.show_page("log", view="ops")))
+        self.log_row.add_suffix(button(icon="document-open-symbolic", tooltip="Open the file",
                                        on_click=lambda: self._open_cfg_path("operation_log")))
         self.ignore_row = row("Ignored files", "Patterns of files never to sync (gitignore style)")
         self.ignore_row.add_suffix(button(icon="document-edit-symbolic", tooltip="Edit",
@@ -613,13 +811,22 @@ class SettingsWindow(Adw.ApplicationWindow):
 
 class SettingsApp(Adw.Application):
     def __init__(self):
-        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
+        super().__init__(application_id=APP_ID,
+                         flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
         self.window = None
 
     def do_activate(self):
         if self.window is None:
             self.window = SettingsWindow(application=self)
         self.window.present()
+
+    def do_command_line(self, command_line):
+        # Also runs in the first instance when launched again (single instance).
+        page, problems = parse_args(command_line.get_arguments()[1:])
+        self.activate()
+        if page:
+            self.window.show_page(page, problems=problems)
+        return 0
 
 
 def main() -> int:

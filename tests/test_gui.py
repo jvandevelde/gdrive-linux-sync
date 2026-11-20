@@ -101,6 +101,16 @@ def notifications(session_bus):
 def run_harness(script, tmp_path, session_bus, display, root, screenshots=None):
     log = tmp_path / "calls.jsonl"
     cfg = tmp_path / "config.json"
+    ops = tmp_path / "ops.jsonl"
+    ops.write_text("\n".join(json.dumps(e) for e in [
+        {"ts": "2026-11-20T09:00:00+00:00", "pair": "Main", "op": "upload", "path": "a.txt",
+         "text": "upload new file a.txt (1.0 KB)"},
+        {"ts": "2026-11-20T09:05:00+00:00", "pair": "Main", "op": "conflict",
+         "path": "b (conflicted copy 2026-11-20 090500).txt", "src": "b.txt",
+         "text": "keep local b.txt as b (conflicted copy 2026-11-20 090500).txt"},
+        {"ts": "2026-11-20T09:10:00+00:00", "pair": "Main", "op": "download", "path": "c.pdf",
+         "text": "download c.pdf (2.0 MB)"},
+    ]) + "\n")
     cfg.write_text(json.dumps({
         "poll_interval_s": 45, "max_transfers": 4, "full_check_hours": 24,
         "prefer_newer_on_rebuild": False,
@@ -122,6 +132,8 @@ def run_harness(script, tmp_path, session_bus, display, root, screenshots=None):
         "GDRIVESYNC_CLI": f"{PY} {HERE / 'gui/fake_cli.py'}",
         "GDRIVESYNC_SYSTEMCTL": f"{PY} {HERE / 'gui/fake_systemctl.py'}",
         "FAKE_LOG": str(log), "FAKE_CONFIG": str(cfg), "SYNC_ROOT": str(root),
+        "FAKE_OPS": str(ops),
+        "GDRIVESYNC_JOURNALCTL": f"{PY} {HERE / 'gui/fake_journalctl.py'}",
         "PYTHONPATH": str(HERE / "gui"),
     }
     (tmp_path / "run").mkdir(mode=0o700, exist_ok=True)

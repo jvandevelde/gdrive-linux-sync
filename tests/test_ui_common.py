@@ -57,3 +57,44 @@ def test_commands_from_env(monkeypatch):
     assert "Exec=/opt/venv/bin/gdrivesync tray" in ui.autostart_entry()
     monkeypatch.setenv("XDG_CONFIG_HOME", "/x")
     assert ui.autostart_path() == "/x/autostart/gdrivesync-tray.desktop"
+
+
+def test_parse_journal_lines():
+    import json
+
+    line = json.dumps({"__REALTIME_TIMESTAMP": "1763600000000000", "PRIORITY": "4",
+                       "MESSAGE": "gdrivesync.daemon: [Main] full check found differences"})
+    e = ui.parse_journal_line(line)
+    assert (e.level, e.problem, e.ts) == ("warning", True, 1763600000.0)
+    assert e.text == "[Main] full check found differences"  # module prefix dropped
+    err = ui.parse_journal_line(json.dumps({"PRIORITY": "3", "MESSAGE": "boom"}))
+    assert err.level == "error" and err.problem
+    binary = ui.parse_journal_line(json.dumps({"PRIORITY": "6", "MESSAGE": [99, 97, 102, 233]}))
+    assert binary.text == "caf�" and not binary.problem
+    legacy = ui.parse_journal_line(json.dumps(
+        {"PRIORITY": "6", "MESSAGE": "2026-01-01 10:00:00 ERROR gdrivesync.engine: x"}))
+    assert legacy.level == "error"
+    plain = ui.parse_journal_line("-- No entries --")
+    assert plain.text == "-- No entries --" and plain.level == "info"
+    assert ui.parse_journal_line("   ") is None
+
+
+def test_parse_ops_lines():
+    import json
+
+    e = ui.parse_ops_line(json.dumps({"ts": "2026-11-20T09:05:00+00:00", "pair": "Work",
+                                      "op": "conflict", "text": "keep local a as b"}))
+    assert e.text == "[Work] Keep local a as b" and e.level == "warning" and e.problem
+    up = ui.parse_ops_line(json.dumps({"ts": "2026-11-20T09:05:00+00:00", "op": "upload",
+                                       "path": "x", "text": "upload new file x"}))
+    assert not up.problem and up.text == "Upload new file x"
+    assert ui.parse_ops_line("not json") is None
+
+
+def test_log_commands(monkeypatch):
+    monkeypatch.setenv("GDRIVESYNC_JOURNALCTL", "journalctl")
+    monkeypatch.setenv("GDRIVESYNC_CLI", "gdrivesync")
+    j = ui.journal_argv()
+    assert j[:4] == ["journalctl", "--user", "--unit", "gdrivesync.service"]
+    assert "--follow" in j and j[-2:] == ["--output", "json"]
+    assert ui.ops_argv() == ["gdrivesync", "log", "--follow", "--json", "-n", "500"]

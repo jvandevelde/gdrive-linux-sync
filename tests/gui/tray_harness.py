@@ -50,6 +50,8 @@ wait(lambda: tray.summary.state != "paused", what="resumed")
 tray.items["sync-now"].activate()
 tray.items["settings"].activate()
 wait(lambda: called("cli", "settings"), what="settings launched")
+tray.items["log"].activate()
+wait(lambda: called("cli", "settings", "--page", "log"), what="log opened")
 
 # a conflict and an error arriving after the first snapshot → notifications
 state = dict(tray.state)
@@ -61,6 +63,9 @@ state["pairs"] = [dict(state["pairs"][0], errors={"Docs/big.iso": "HttpError 403
 tray.apply(state)
 assert tray.summary.state == "error" and tray.indicator.get_icon() == "dialog-warning-symbolic"
 assert labels()[0] == "1 item couldn't sync"
+assert tray.items["status"].get_sensitive()  # clickable → the log, problems only
+tray.items["status"].activate()
+wait(lambda: called("cli", "settings", "--page", "log", "--problems"), what="problems log")
 
 # service gone → offline icon, "Start syncing" item, and a notification
 tray.apply(None)

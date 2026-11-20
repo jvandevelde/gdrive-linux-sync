@@ -4,6 +4,7 @@ so it runs on any interpreter and is unit-tested directly."""
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
 from dataclasses import dataclass, field
@@ -163,3 +164,95 @@ def short_time(iso: str) -> str:
         return ""
     now = datetime.now().astimezone()
     return t.strftime("%H:%M") if t.date() == now.date() else t.strftime("%b %d")
+
+
+# ---------------------------------------------------------------- log viewer
+
+LOG_LINES = 500
+PROBLEM_OPS = {"conflict", "trash_remote", "trash_local", "delete_local"}
+_LEVEL_WORD = re.compile(r"\b(CRITICAL|ERROR|WARNING)\b")
+_MODULE_PREFIX = re.compile(r"^gdrivesync(\.\w+)*: ")
+
+
+def journal_argv(lines: int = LOG_LINES) -> list[str]:
+    cmd = shlex.split(os.environ.get("GDRIVESYNC_JOURNALCTL", "journalctl"))
+    return cmd + ["--user", "--unit", SERVICE_UNIT, "--no-pager", "--lines", str(lines),
+                  "--follow", "--output", "json"]
+
+
+def ops_argv(lines: int = LOG_LINES) -> list[str]:
+    return cli_command() + ["log", "--follow", "--json", "-n", str(lines)]
+
+
+@dataclass
+class LogEntry:
+    ts: float  # unix time
+    level: str  # error | warning | info
+    text: str
+    problem: bool
+
+
+def parse_journal_line(line: str) -> LogEntry | None:
+    """One `journalctl --output json` line. Non-JSON lines (journalctl's own
+    messages, e.g. 'No entries') are kept as plain text."""
+    import json
+    import time
+
+    if not line.strip():
+        return None
+    try:
+        d = json.loads(line)
+    except ValueError:
+        return LogEntry(time.time(), "info", line.strip(), False)
+    msg = d.get("MESSAGE", "")
+    if isinstance(msg, list):  # binary-safe encoding for non-UTF-8 messages
+        msg = bytes(msg).decode("utf-8", "replace")
+    elif msg is None:
+        msg = ""
+    try:
+        prio = int(d.get("PRIORITY", 6))
+    except (TypeError, ValueError):
+        prio = 6
+    if prio == 6:  # older lines logged without a level prefix
+        m = _LEVEL_WORD.search(msg[:60])
+        if m:
+            prio = 4 if m.group(1) == "WARNING" else 3
+    try:
+        ts = int(d.get("__REALTIME_TIMESTAMP", 0)) / 1e6
+    except (TypeError, ValueError):
+        ts = 0.0
+    level = "error" if prio <= 3 else "warning" if prio == 4 else "info"
+    msg = _MODULE_PREFIX.sub("", msg, count=1)  # "gdrivesync.ops: …" → "…"
+    return LogEntry(ts, level, msg, prio <= 4)
+
+
+def parse_ops_line(line: str) -> LogEntry | None:
+    """One `gdrivesync log --json` line."""
+    import json
+    from datetime import datetime
+
+    try:
+        d = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(d, dict):
+        return None
+    try:
+        ts = datetime.fromisoformat(d.get("ts", "")).timestamp()
+    except ValueError:
+        ts = 0.0
+    op = d.get("op", "")
+    text = sentence(d.get("text") or f"{op} {d.get('path', '')}")
+    if d.get("pair"):
+        text = f"[{d['pair']}] {text}"
+    return LogEntry(ts, "warning" if op == "conflict" else "info", text, op in PROBLEM_OPS)
+
+
+def log_time(ts: float) -> str:
+    from datetime import datetime
+
+    if not ts:
+        return ""
+    t = datetime.fromtimestamp(ts)
+    return t.strftime("%H:%M:%S") if t.date() == datetime.now().date() else \
+        t.strftime("%b %d %H:%M")

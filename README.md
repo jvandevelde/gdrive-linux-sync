@@ -85,14 +85,21 @@ stops.
 
 The **settings window**:
 
-| Status | Folders | Settings |
-|---|---|---|
-| ![Status page](docs/screenshots/settings-status.png) | ![Folders page](docs/screenshots/settings-folders.png) | ![Settings page](docs/screenshots/settings-settings.png) |
+| Status | Folders |
+|---|---|
+| ![Status page](docs/screenshots/settings-status.png) | ![Folders page](docs/screenshots/settings-folders.png) |
+| **Log** | **Settings** |
+| ![Log page](docs/screenshots/settings-log.png) | ![Settings page](docs/screenshots/settings-settings.png) |
 
 - **Status** — overall state, Sync Now / Pause, each folder, problems, recent activity.
 - **Folders** — add or remove folder pairs; bring back folders you stopped syncing locally.
 - **Settings** — how often to check Drive, the daily full check, the rebuild conflict rule,
   sync and status icon at login, Files integration, operation log and ignore file.
+- **Log** — the sync service's own log (live, newest first) and the operation log, with
+  search, a *warnings & errors* / *deletions & conflicts* filter, and copy-to-clipboard
+  for bug reports. The status icon's **Show log…** opens it, and clicking its
+  "N items couldn't sync" line opens it filtered to problems
+  (`gdrivesync settings --page log --problems` does the same).
 - **Account** — who you're signed in as, storage, sign in again.
 
 Changes go through the same `gdrivesync` commands described below. Some settings need the
@@ -183,6 +190,8 @@ gdrivesync log                      # last 50 operations actually performed
 gdrivesync log -f                   # follow live (like tail -f)
 gdrivesync log -n 0 --pair Work     # everything for one pair
 gdrivesync log --json | jq .        # raw records
+gdrivesync journal -f               # the service's own log (systemd journal), live
+gdrivesync journal --errors         # only warnings and errors
 ```
 
 The dry run uses the real sync logic on a throwaway copy of the sync state: Drive is

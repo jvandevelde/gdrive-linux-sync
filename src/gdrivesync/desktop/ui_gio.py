@@ -172,3 +172,59 @@ def spawn(argv) -> bool:
         return True
     except GLib.Error:
         return False
+
+
+class LineStream:
+    """Run a command and hand each output line to on_line(str) as it arrives
+    (for `journalctl --follow` / `gdrivesync log -f`). Never blocks the UI.
+    on_exit(ok) is called when the command ends; stop() ends it early."""
+
+    def __init__(self, argv, on_line, on_exit=None):
+        self.on_line, self.on_exit = on_line, on_exit
+        self.cancel = Gio.Cancellable()
+        self.proc = None
+        try:
+            self.proc = Gio.Subprocess.new(
+                argv, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE
+            )
+        except GLib.Error as e:
+            GLib.idle_add(lambda: self._finish(False, e.message) and False)
+            return
+        self.stream = Gio.DataInputStream.new(self.proc.get_stdout_pipe())
+        self._read()
+
+    def _read(self):
+        self.stream.read_line_async(GLib.PRIORITY_DEFAULT, self.cancel, self._got)
+
+    def _got(self, stream, res):
+        try:
+            line, _length = stream.read_line_finish_utf8(res)
+        except GLib.Error as e:
+            if not self.cancel.is_cancelled():
+                self._finish(False, e.message)
+            return
+        if line is None:  # end of output
+            self.proc.wait_async(None, lambda p, r: self._finish(p.get_successful(), ""))
+            return
+        self.on_line(line)
+        self._read()
+
+    def _finish(self, ok, message):
+        if self.on_exit:
+            self.on_exit(ok, message)
+
+    def stop(self):
+        self.cancel.cancel()
+        if self.proc is not None:
+            self.proc.force_exit()
+
+
+def set_clipboard(text: str):
+    gi.require_version("Gdk", "4.0")
+    from gi.repository import Gdk
+
+    cb = Gdk.Display.get_default().get_clipboard()
+    try:
+        cb.set(text)
+    except (AttributeError, TypeError):
+        cb.set_content(Gdk.ContentProvider.new_for_value(text))

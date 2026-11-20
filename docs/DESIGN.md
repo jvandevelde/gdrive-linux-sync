@@ -212,11 +212,17 @@ settings`, which `exec` the system Python on `desktop/gdrivesync_*.py` with
   re-include excluded folders), Settings (poll interval, full-check interval,
   newer-wins on rebuild, sync at login via `systemctl --user enable`, tray at
   login via an XDG autostart entry, Files integration, log and ignore file),
-  Account (whoami, sign in again). Reads: D-Bus `GetState` + `gdrivesync config
+  Log (live journal via `journalctl --user -u gdrivesync -o json --follow` and the
+  operation log via `gdrivesync log --follow --json`, each streamed line by line
+  with `Gio.DataInputStream`, newest first, capped at 2000 rows, with search and a
+  problems filter), Account (whoami, sign in again). Reads: D-Bus `GetState` + `gdrivesync config
   --json`. Writes: the same CLI commands a user would run (so validation and
   per-pair locking are shared); removing a pair stops the service around
   `pair remove` because the service holds the pair's lock. Settings changes show
   a "Restart the sync service" banner.
+- **Journal priorities:** under systemd (`JOURNAL_STREAM` set) the service logs
+  `<N>`-prefixed lines without timestamps, so journald stores real priorities
+  (`journalctl -p warning`, `gdrivesync journal --errors`, the viewer's filter).
 - **Testing:** `tests/test_gui.py` runs both UIs under Xvfb against the real
   service on a private bus, with recording fakes for the CLI and systemctl and a
   fake notification server; the settings test also saves screenshots.

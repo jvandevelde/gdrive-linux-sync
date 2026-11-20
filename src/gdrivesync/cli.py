@@ -25,11 +25,34 @@ def _client():
     return DriveClient(auth.load_credentials())
 
 
+class JournalFormatter(logging.Formatter):
+    """Under systemd, prefix lines with their syslog level (<3> error, <4> warning,
+    …) so journald records the real priority (`journalctl -p warning` works); the
+    journal adds its own timestamps."""
+
+    LEVELS = {logging.DEBUG: 7, logging.INFO: 6, logging.WARNING: 4, logging.ERROR: 3,
+              logging.CRITICAL: 2}
+
+    def format(self, record):
+        prio = self.LEVELS.get(record.levelno, 6)
+        text = f"{record.name}: {record.getMessage()}"
+        if record.exc_info:
+            text += "\n" + self.formatException(record.exc_info)
+        # Every line of a multi-line message (tracebacks) gets the prefix.
+        return "\n".join(f"<{prio}>{line}" for line in text.splitlines())
+
+
 def _setup_logging(verbose: bool) -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    import os
+
+    handler = logging.StreamHandler()
+    if os.environ.get("JOURNAL_STREAM"):  # started by systemd, stderr goes to the journal
+        handler.setFormatter(JournalFormatter())
+    else:
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    root.handlers[:] = [handler]
+    root.setLevel(logging.DEBUG if verbose else logging.INFO)
     logging.getLogger("googleapiclient").setLevel(logging.WARNING)
 
 
@@ -589,13 +612,14 @@ def cmd_log(args: argparse.Namespace) -> int:
         if args.pair and e.get("pair") != args.pair:
             return
         if args.json:
-            print(json.dumps(e, ensure_ascii=False))
+            print(json.dumps({**e, "text": describe({**e, "pair": ""})}, ensure_ascii=False),
+                  flush=True)
             return
         try:
             ts = datetime.fromisoformat(e["ts"]).astimezone().strftime("%Y-%m-%d %H:%M:%S")
         except (KeyError, ValueError):
             ts = e.get("ts", "?")
-        print(f"{ts}  {describe(e)}")
+        print(f"{ts}  {describe(e)}", flush=True)
 
     entries = [e for e in read_entries(path) if not args.pair or e.get("pair") == args.pair]
     for e in deque(entries, maxlen=args.n) if args.n else entries:
@@ -683,12 +707,46 @@ def _launch_gui(script: str, extra: list[str]) -> int:
     return 0  # not reached
 
 
+SERVICE_UNIT = "gdrivesync.service"
+
+
+def journal_command(follow=False, errors=False, lines=100, output=None) -> list[str]:
+    import os
+    import shlex
+
+    cmd = shlex.split(os.environ.get("GDRIVESYNC_JOURNALCTL", "journalctl"))
+    cmd += ["--user", "--unit", SERVICE_UNIT, "--no-pager", "--lines", str(lines)]
+    if follow:
+        cmd.append("--follow")
+    if errors:
+        cmd += ["--priority", "warning"]
+    if output:
+        cmd += ["--output", output]
+    return cmd
+
+
+def cmd_journal(args: argparse.Namespace) -> int:
+    """The sync service's own log (systemd journal)."""
+    import os
+    import shutil
+
+    cmd = journal_command(args.follow, args.errors, args.n)
+    if shutil.which(cmd[0]) is None and not os.path.exists(cmd[0]):
+        print("error: journalctl isn't available on this system", file=sys.stderr)
+        return 1
+    os.execvp(cmd[0], cmd)
+    return 0  # not reached
+
+
 def cmd_tray(args: argparse.Namespace) -> int:
     return _launch_gui("gdrivesync_tray.py", [])
 
 
 def cmd_settings(args: argparse.Namespace) -> int:
-    return _launch_gui("gdrivesync_settings.py", [])
+    extra = ["--page", args.page] if args.page else []
+    if args.problems:
+        extra.append("--problems")
+    return _launch_gui("gdrivesync_settings.py", extra)
 
 
 def cmd_install_desktop(args: argparse.Namespace) -> int:
@@ -863,7 +921,16 @@ def build_parser() -> argparse.ArgumentParser:
     tr = sub.add_parser("tray", help="show the status icon in the top bar")
     tr.set_defaults(func=cmd_tray)
     st = sub.add_parser("settings", help="open the settings window")
+    st.add_argument("--page", choices=["status", "folders", "log", "settings", "account"])
+    st.add_argument("--problems", action="store_true",
+                    help="with --page log: show only warnings and errors")
     st.set_defaults(func=cmd_settings)
+
+    jr = sub.add_parser("journal", help="show the sync service's log (systemd journal)")
+    jr.add_argument("-f", "--follow", action="store_true", help="keep printing new lines")
+    jr.add_argument("--errors", action="store_true", help="only warnings and errors")
+    jr.add_argument("-n", type=int, default=100, help="how many recent lines")
+    jr.set_defaults(func=cmd_journal)
     ins.set_defaults(func=cmd_install_desktop)
 
     cfg = sub.add_parser("config", help="show or change settings")
